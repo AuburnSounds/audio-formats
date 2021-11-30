@@ -896,7 +896,7 @@ bool pocketmod_seek(pocketmod_context* c, int pattern, int row, int tick)
 {
     // NOTE: This is untested.
     c.line = cast(byte)row;
-    c.pattern = cast(byte)pattern;
+    c.pattern = c.order[cast(byte)pattern];
     c.tick = cast(short)tick;
     c.sample = 0;
     return true; // TODO check that the pattern exist, the row exist, and the tick exist. Else return false.
