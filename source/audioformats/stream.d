@@ -1954,7 +1954,10 @@ nothrow @nogc:
         CString strZ = CString(path);
         file = fopen(strZ.storage, forWrite ? "wb".ptr : "rb".ptr);
         if (file is null)
+        {
             *err = true;
+            return;
+        }
 
         // finds the size of the file
         fseek(file, 0, SEEK_END); // TODO check error here
