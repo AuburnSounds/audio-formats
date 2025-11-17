@@ -104,7 +104,8 @@ module audioformats.stb_vorbis2;
 
 import core.stdc.stdlib: malloc, free, qsort, abs;
 import core.stdc.string: memset, memcmp, memcpy;
-import std.math: ldexp, sin, cos, floor, exp, log, pow;
+import core.stdc.math: ldexp, sin, cos, floor, exp, log, pow;
+
 import audioformats.io;
 
 nothrow:

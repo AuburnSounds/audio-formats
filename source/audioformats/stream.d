@@ -108,7 +108,7 @@ nothrow @nogc:
     /// This stream will be opened for reading only.
     ///
     /// Params: 
-    ///     path An UTF-8 path to the sound file.
+    ///     path = An UTF-8 path to the sound file.
     ///
     /// Note: throws a manually allocated exception in case of error. Free it with `destroyAudioFormatsException`.
     // TODO: break API, make that nothrow, and use isError flag instead
@@ -145,7 +145,8 @@ nothrow @nogc:
     /// This stream will be opened for reading only.
     /// Note: throws a manually allocated exception in case of error. Free it with `destroyAudioFormatsException`.
     ///
-    /// Params: inputData The whole file to decode.
+    /// Params: 
+    ///     inputData = The whole file to decode.
     // TODO: break API, make that nothrow, and use isError flag instead
     void openFromMemory(const(ubyte)[] inputData) @nogc
     {
@@ -174,10 +175,11 @@ nothrow @nogc:
     /// Note: throws a manually allocated exception in case of error. Free it with `destroyAudioFormatsException`.
     ///
     /// Params: 
-    ///     path An UTF-8 path to the sound file.
-    ///     format Audio file format to generate.
-    ///     sampleRate Sample rate of this audio stream. This samplerate might be rounded up to the nearest integer number.
-    ///     numChannels Number of channels of this audio stream.
+    ///     path = An UTF-8 path to the sound file.
+    ///     format = Audio file format to generate.
+    ///     sampleRate = Sample rate of this audio stream. This samplerate might be rounded up to the nearest integer number.
+    ///     numChannels = Number of channels of this audio stream.
+    ///     options = Encoding options.
     // TODO: break API, make that nothrow, and use isError flag instead
     void openToFile(const(char)[] path, 
                     AudioFileFormat format, 
@@ -219,9 +221,10 @@ nothrow @nogc:
     /// Note: throws a manually allocated exception in case of error. Free it with `destroyAudioFormatsException`.
     ///
     /// Params: 
-    ///     format Audio file format to generate.
-    ///     sampleRate Sample rate of this audio stream. This samplerate might be rounded up to the nearest integer number.
-    ///     numChannels Number of channels of this audio stream.
+    ///     format = Audio file format to generate.
+    ///     sampleRate = Sample rate of this audio stream. This samplerate might be rounded up to the nearest integer number.
+    ///     numChannels = Number of channels of this audio stream.
+    ///     options = Encoding options.
     // TODO: break API, make that nothrow, and use isError flag instead
     void openToBuffer(AudioFileFormat format, 
                       float sampleRate, 
@@ -253,11 +256,12 @@ nothrow @nogc:
     /// Note: throws a manually allocated exception in case of error. Free it with `destroyAudioFormatsException`.
     ///
     /// Params: 
-    ///     data Pointer to output memory.
-    ///     size_t maxLength.
-    ///     format Audio file format to generate.
-    ///     sampleRate Sample rate of this audio stream. This samplerate might be rounded up to the nearest integer number.
-    ///     numChannels Number of channels of this audio stream.
+    ///     data = Pointer to output memory.
+    ///     maxLength = Maximum size of output stream, in bytes.
+    ///     format = Audio file format to generate.
+    ///     sampleRate = Sample rate of this audio stream. This samplerate might be rounded up to the nearest integer number.
+    ///     numChannels = Number of channels of this audio stream.
+    ///     options = Encoding options.
     // TODO: break API, make that nothrow, and use isError flag instead
     void openToMemory(ubyte* data, 
                       size_t maxLength,

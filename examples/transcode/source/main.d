@@ -1,90 +1,98 @@
 module main;
 
-import std.stdio;
-import std.file;
-
 import audioformats;
 import core.stdc.stdlib;
+import core.stdc.stdio;
 
+import numem;
 
 //debug = checkSeeking;
 
-void main(string[] args)
-{
+int main(string[] args)
+{   
     if (args.length != 3)
-        throw new Exception("usage: transcode input.{mp3|wav|flac|ogg|opus|qoa|mod|xm} output.{wav|qoa}");
+    {
+        printf("usage: transcode input.{mp3|wav|flac|ogg|opus|qoa|mod|xm} output.{wav|qoa}\n");
+        return 1;
+    }
 
     string inputPath = args[1];
     string outputPath = args[2];
-
-    try
+    
+    void check(ref AudioStream stream)
     {
-        void check(ref AudioStream stream)
-        {
-            if (stream.isError)
-                throw new Exception(stream.errorMessage);
-        }
-
-        AudioStream input, output;
-
-        input.openFromFile(args[1]);
-        check(input);
-        float sampleRate = input.getSamplerate();
-        int channels = input.getNumChannels();
-        long lengthFrames = input.getLengthInFrames();
-
-        writefln("Opening %s:", inputPath);
-        writefln("  * format     = %s", convertAudioFileFormatToString(input.getFormat()) );
-        writefln("  * samplerate = %s Hz", sampleRate);
-        writefln("  * channels   = %s", channels);
-        if (lengthFrames == audiostreamUnknownLength)
-        {
-            writefln("  * length     = unknown");
-        }
-        else
-        {
-            double seconds = lengthFrames / cast(double) sampleRate;
-            writefln("  * length     = %.3g seconds (%s frames)", seconds, lengthFrames);
-        }
-
-        debug(checkSeeking) additionalTests(input);
-
-        float[] buf = new float[1024 * channels];
-
-        EncodingOptions options;
-        options.sampleFormat = AudioSampleFormat.s24;
-        options.enableDither = true;
-
-        bool isQOA = outputPath.length > 4 && outputPath[$-4..$] == ".qoa";
-        AudioFileFormat outFormat = AudioFileFormat.wav;
-        if (isQOA) 
-        {
-            outFormat = AudioFileFormat.qoa;
-        }
-
-        output.openToFile(outputPath, outFormat, sampleRate, channels, options);
-        check(output);
-
-        // Chunked encode/decode
-        int totalFrames = 0;
-        int framesRead;
-        do
-        {
-            framesRead = input.readSamplesFloat(buf);
-            check(input);
-            output.writeSamplesFloat(buf[0..framesRead*channels]);
-            check(output);
-            totalFrames += framesRead;
-        } while(framesRead > 0);
-
-        output.destroy();
         
-        writefln("=> %s frames decoded and encoded to %s", totalFrames, outputPath);
     }
-    catch(Exception e)
+
+    AudioStream input, output;
+
+    input.openFromFile(args[1]);
+    check(input);
+    float sampleRate = input.getSamplerate();
+    int channels = input.getNumChannels();
+    long lengthFrames = input.getLengthInFrames();
+
+    printf("Opening %.*s\n", cast(int)inputPath.length, inputPath.ptr);
+    printf("  * format     = %d\n", input.getFormat() );
+    printf("  * samplerate = %f Hz\n", sampleRate);
+    printf("  * channels   = %d\n", channels);
+    if (lengthFrames == audiostreamUnknownLength)
     {
-        writeln(e.msg);
+        printf("  * length     = unknown\n");
     }
+    else
+    {
+        double seconds = lengthFrames / cast(double) sampleRate;
+        printf("  * length     = %.3g seconds (%lld frames)\n", seconds, lengthFrames);
+    }
+
+    debug(checkSeeking) additionalTests(input);
+
+    float[] buf = nu_malloca!float(1024 * channels);
+    scope(exit) nu_freea(buf);
+
+    EncodingOptions options;
+    options.sampleFormat = AudioSampleFormat.s24;
+    options.enableDither = true;
+
+    bool isQOA = outputPath.length > 4 && outputPath[$-4..$] == ".qoa";
+    AudioFileFormat outFormat = AudioFileFormat.wav;
+    if (isQOA) 
+    {
+        outFormat = AudioFileFormat.qoa;
+    }
+
+    output.openToFile(outputPath, outFormat, sampleRate, channels, options);
+    if (output.isError)
+    {
+        const(char)[] err = output.errorMessage;
+        printf("error: %.*s\n", cast(int) err.length, err.ptr);
+    }
+
+    // Chunked encode/decode
+    int totalFrames = 0;
+    int framesRead;
+    do
+    {
+        framesRead = input.readSamplesFloat(buf);
+        if (input.isError)
+        {
+            const(char)[] err = input.errorMessage;
+            printf("error: %.*s\n", cast(int) err.length, err.ptr);
+        }
+        output.writeSamplesFloat(buf[0..framesRead*channels]);
+        if (output.isError)
+        {
+            const(char)[] err = output.errorMessage;
+            printf("error: %.*s\n", cast(int) err.length, err.ptr);
+        }
+        totalFrames += framesRead;
+    } while(framesRead > 0);
+
+    //output.destroy(); // to flush? not sure why it's here
+        
+    printf("=> %d frames decoded and encoded to %.*s\n", totalFrames, cast(int)outputPath.length, outputPath.ptr);
+    return 0;
 }
 
 debug(checkSeeking)

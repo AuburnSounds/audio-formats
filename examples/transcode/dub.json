@@ -1,15 +1,17 @@
 {
     "name": "transcode",
-    "description": "Decode MP3/WAV input, output a WAV.",
+    "description": "Decode MP3/WAV input, output a WAV. Nurt example.",
     "license": "LGPL-2.1+BSL-1.0+MIT",
 
     "dependencies": 
     {
-        "audio-formats": { "path": "../.." }
+        "audio-formats": { "path": "../.." },
+        "nurt": ">=0.2.1"
     },
 
     "subConfigurations":
     {
-        "audio-formats": "lgpl"
+        "audio-formats": "lgpl",
+        "nurt": "nurt-disabled"
     }
 }

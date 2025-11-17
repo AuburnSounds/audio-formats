@@ -10,7 +10,7 @@ module audioformats.libxm;
 import core.stdc.config: c_ulong;
 import core.stdc.stdlib: malloc, free;
 import core.stdc.string: memcpy, memcmp, memset;
-import std.math;
+import core.stdc.math: sin, pow, fabsf, sqrtf;
 
 nothrow:
 @nogc:
@@ -2275,7 +2275,7 @@ void xm_tick(xm_context_t* ctx) {
 		float panning, volume;
 
 		panning = ch.panning +
-			(ch.panning_envelope_panning - .5f) * (.5f - abs(ch.panning - .5f)) * 2.0f;
+			(ch.panning_envelope_panning - .5f) * (.5f - fabsf(ch.panning - .5f)) * 2.0f;
 
 		if(ch.tremor_on) {
             volume = .0f;
@@ -2290,8 +2290,8 @@ void xm_tick(xm_context_t* ctx) {
         {
 		    /* See https://modarchive.org/forums/index.php?topic=3517.0
             * and https://github.com/Artefact2/libxm/pull/16 */
-		    ch.target_volume[0] = volume * sqrt(1.0f - panning);
-		    ch.target_volume[1] = volume * sqrt(panning);
+		    ch.target_volume[0] = volume * sqrtf(1.0f - panning);
+		    ch.target_volume[1] = volume * sqrtf(panning);
         }
         else
         {
