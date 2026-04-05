@@ -5,7 +5,7 @@
 ## Features
 
 - ✅ Decode from WAV / QOA / MP3 / FLAC / OPUS / OGG / MOD / XM
-- ✅ Encode to WAV / QOA
+- ✅ Encode to WAV / QOA / FLAC
 - ✅ File and memory support
 - ✅ Seeking support
 - ✅ Chunked support
@@ -22,14 +22,15 @@
 - Complete removal of exceptions. The API is now 100% `nothrow @nogc`.
   `AudioFormatsException` doesn't exist anymore.
 - **BREAKING** Instead, use `.isError` and `.isValid` to check for errors.
+- **v3.1** FLAC format encoding support.
 
 ### 🔔 `audio-formats` v2
 
 - Doesn't depend upon `dplug:core` anymore.
-- All exceptions thrown by `audio-formats` are now `AudioFormatsException`.  
+- All exceptions thrown by `audio-formats` are now `AudioFormatsException`.
   They must be clean-up with `destroyAudioFormatException`.
-- **v2.1** QOA format decoding support (https://github.com/phoboslab/qoa). 
-  Note that the QOA bitstream isn't finalized, and will change. 
+- **v2.1** QOA format decoding support (https://github.com/phoboslab/qoa).
+  Note that the QOA bitstream isn't finalized, and will change.
 - **v2.2** QOA format encoding support.
 
 ### 🔔 `audio-formats` v1
@@ -47,7 +48,7 @@
 |-------|------------|----------|-----------------|
 | 📀 WAV   | Yes        | Yes      | Sample          |
 | 📀 MP3   | Yes        | No       | Sample          |
-| 📀 FLAC  | Yes        | No       | Sample          |
+| 📀 FLAC  | Yes        | Yes (LGPL) | Sample        |
 | 📀 OPUS  | Yes (LGPL) | No       | Sample          |
 | 📀 OGG   | Yes        | No       | Sample          |
 | 📀 QOA   | Yes        | Yes      | Sample          |
@@ -62,7 +63,7 @@ _Some of these decoders were originally translated by Ketmar, who did the heavy-
 
 - ⚖️ Boost license otherwise.
 - ⚖️ MIT license when including QOA.
-- ⚖️ LGPL v2.1 for OPUS.
+- ⚖️ LGPL v2.1 for OPUS decoding and FLAC encoding.
 (use DUB subconfigurations) to choose, default is boost.
 
 ## External links and references
