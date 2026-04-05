@@ -4,8 +4,6 @@ import audioformats;
 import core.stdc.stdlib;
 import core.stdc.stdio;
 
-import numem;
-
 //debug = checkSeeking;
 
 int main(string[] args)
@@ -18,16 +16,11 @@ int main(string[] args)
 
     string inputPath = args[1];
     string outputPath = args[2];
-    
-    void check(ref AudioStream stream)
-    {
-        
-    }
 
     AudioStream input, output;
 
     input.openFromFile(args[1]);
-    check(input);
+
     float sampleRate = input.getSamplerate();
     int channels = input.getNumChannels();
     long lengthFrames = input.getLengthInFrames();
@@ -48,20 +41,20 @@ int main(string[] args)
 
     debug(checkSeeking) additionalTests(input);
 
-    float[] buf = nu_malloca!float(1024 * channels);
-    scope(exit) nu_freea(buf);
+    float[] buf = new float[1024 * channels];
 
     EncodingOptions options;
     options.sampleFormat = AudioSampleFormat.s24;
     options.enableDither = true;
 
+    options.flacQuality = 5; // 0 to 12
+
+    bool isFLAC = outputPath.length > 5 && outputPath[$-5..$] == ".flac";
     bool isQOA = outputPath.length > 4 && outputPath[$-4..$] == ".qoa";
     AudioFileFormat outFormat = AudioFileFormat.wav;
-    if (isQOA) 
-    {
-        outFormat = AudioFileFormat.qoa;
-    }
-
+    if (isQOA) outFormat = AudioFileFormat.qoa;
+    if (isFLAC) outFormat = AudioFileFormat.flac;
+    
     output.openToFile(outputPath, outFormat, sampleRate, channels, options);
     if (output.isError)
     {
@@ -89,8 +82,12 @@ int main(string[] args)
         totalFrames += framesRead;
     } while(framesRead > 0);
 
-    //output.destroy(); // to flush? not sure why it's here
-        
+    if (!output.finalizeEncoding())
+    {
+        const(char)[] err = output.errorMessage;
+        printf("error while encoding: %.*s\n", cast(int) err.length, err.ptr);
+    }
+
     printf("=> %d frames decoded and encoded to %.*s\n", totalFrames, cast(int)outputPath.length, outputPath.ptr);
     return 0;
 }
@@ -169,3 +166,4 @@ debug(checkSeeking)
         }
     }
 }
+

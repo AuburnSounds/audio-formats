@@ -15,6 +15,7 @@ import audioformats.internals;
 
 version(decodeMP3) import audioformats.minimp3_ex;
 version(decodeFLAC) import audioformats.drflac;
+version(encodeFLAC) import audioformats.uflac_enc;
 version(decodeOGG) import audioformats.stb_vorbis2;
 version(decodeOPUS) import audioformats.dopus;
 version(decodeMOD) import audioformats.pocketmod;
@@ -59,11 +60,15 @@ enum AudioSampleFormat
 /// An optional struct, passed when encoding a sound (WAV or QOA).
 struct EncodingOptions
 {
-    /// The desired sample bitdepth to encode with. This ignored for QOA.
+    /// The desired sample bitdepth to encode with. This ignored for QOA and FLAC.
     AudioSampleFormat sampleFormat = AudioSampleFormat.fp32; // defaults to 32-bit float
 
     /// Enable dither when exporting 8-bit, 16-bit, 24-bit WAV, or QOA
+    /// Ignored for FLAC.
     bool enableDither = true;
+
+    /// FLAC encoder quality.
+    int flacQuality = 5;
 }
 
 /// Returns: String representation of an `AudioFileFormat`.
@@ -770,7 +775,6 @@ nothrow @nogc:
         final switch(_format)
         {
             case AudioFileFormat.mp3:
-            case AudioFileFormat.flac:
             case AudioFileFormat.ogg:
             case AudioFileFormat.opus:
             case AudioFileFormat.mod:
@@ -813,6 +817,24 @@ nothrow @nogc:
                 else
                 {
                     assert(false, "no support for WAV encoding");
+                }
+            }
+            case AudioFileFormat.flac:
+            {
+                version(encodeFLAC)
+                {
+                    bool err;
+                    int writtenFrames = _flacEncoder.writeSamples(inData, frames, &err);
+                    if (err)
+                    {
+                        setError(kErrorEncodingError.ptr);
+                        return 0;
+                    }
+                    return writtenFrames;
+                }
+                else
+                {
+                    assert(false, "no support for FLAC encoding");
                 }
             }
         }
@@ -1291,7 +1313,6 @@ nothrow @nogc:
         final switch(_format) with (AudioFileFormat)
         {
             case mp3:
-            case flac:
             case ogg:
             case opus:
             case mod:
@@ -1321,6 +1342,24 @@ nothrow @nogc:
                         assert(_wavEncoder !is null);
                         bool err;
                         _wavEncoder.finalizeEncoding(&err);
+                        if (err)
+                        {
+                            setError(kErrorEncodingError.ptr);
+                            return false;
+                        }
+                        break;
+                    }
+                    else
+                        assert(false);
+                }
+
+            case flac:
+                { 
+                    version(encodeFLAC)
+                    {
+                        assert(_flacEncoder !is null);
+                        bool err;
+                        _flacEncoder.finalizeEncoding(&err);
                         if (err)
                         {
                             setError(kErrorEncodingError.ptr);
@@ -1431,10 +1470,14 @@ private:
         long _opusPositionFrame;
     }
 
-    // Encoder
     version(encodeWAV)
     {
         WAVEncoder _wavEncoder;
+    }
+
+    version(encodeFLAC)
+    {
+        FLACEncoder _flacEncoder;
     }
 
     // Clean-up encoder/decoder-related data, but not I/O related things. Useful to restart the decoder.
@@ -1529,6 +1572,15 @@ private:
             {
                 destroyFree(_wavEncoder);
                 _wavEncoder = null;
+            }
+        }
+
+        version(encodeFLAC)
+        {
+            if (_flacEncoder !is null)
+            {
+                destroyFree(_flacEncoder);
+                _flacEncoder = null;
             }
         }
     }
@@ -1858,7 +1910,6 @@ private:
         final switch(format) with (AudioFileFormat)
         {
             case mp3:  
-            case flac:
             case ogg:
             case opus:
             case mod:
@@ -1896,6 +1947,22 @@ private:
                     }
                     bool err;
                     _wavEncoder = mallocNew!WAVEncoder(_io, userData, isampleRate, numChannels, wavfmt, options.enableDither, &err);
+                    if (err)
+                        setError(kErrorEncodingError.ptr); 
+                    break;
+                }
+                else
+                {
+                    setError(kErrorUnsupportedEncodingFormat.ptr); 
+                    break;
+                }
+            }
+            case flac:
+            {
+                version(encodeFLAC)
+                {
+                    bool err;
+                    _flacEncoder = mallocNew!FLACEncoder(_io, userData, isampleRate, numChannels, options.flacQuality, &err);
                     if (err)
                         setError(kErrorEncodingError.ptr); 
                     break;

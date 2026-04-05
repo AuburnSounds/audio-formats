@@ -1,0 +1,2520 @@
+ /**
+ * Flake: FLAC audio encoder
+ * Copyright (c) 2006 Justin Ruggles
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+/* public domain Simple, Minimalistic, FLAC encoder based on Flake
+ * ©2018-2020 Yuichiro Nakada
+ *
+/*
+    Copyright (c) 2026 Guillaume Piolat (D translation).
+    To be clear, LGPL + public domain is still LGPL.
+*/
+module audioformats.uflac_enc;
+
+version(encodeFLAC):
+
+
+import core.stdc.stdlib: malloc, free, calloc;
+import core.stdc.string: memset, memcpy;
+import core.stdc.math: fabs;
+
+import audioformats.io;
+import audioformats.internals;
+import audioformats.uflac_md5;
+
+// PERF: whole MD5 hash business looks unused?
+
+// TODO remove that
+import core.stdc.stdio: stderr, FILE, fprintf, fopen, fclose, fwrite;
+
+nothrow @nogc:
+
+enum int FLAKE_ORDER_METHOD_MAX    = 0;
+enum int FLAKE_ORDER_METHOD_EST    = 1;
+enum int FLAKE_ORDER_METHOD_2LEVEL = 2;
+enum int FLAKE_ORDER_METHOD_4LEVEL = 3;
+enum int FLAKE_ORDER_METHOD_8LEVEL = 4;
+enum int FLAKE_ORDER_METHOD_SEARCH = 5;
+enum int FLAKE_ORDER_METHOD_LOG    = 6;
+
+enum int FLAKE_STEREO_METHOD_INDEPENDENT = 0;
+enum int FLAKE_STEREO_METHOD_ESTIMATE    = 1;
+
+enum int FLAKE_PREDICTION_NONE      = 0;
+enum int FLAKE_PREDICTION_FIXED     = 1;
+enum int FLAKE_PREDICTION_LEVINSON  = 2;
+
+struct FlakeEncodeParams 
+{
+    // compression quality
+    // set by user prior to calling flake_encode_init
+    // standard values are 0 to 8
+    // 0 is lower compression, faster encoding
+    // 8 is higher compression, slower encoding
+    // extended values 9 to 12 are slower and/or use
+    // higher prediction orders
+    int compression;
+
+    // prediction order selection method
+    // set by user prior to calling flake_encode_init
+    // if set to less than 0, it is chosen based on compression.
+    // valid values are 0 to 5
+    // 0 = use maximum order only
+    // 1 = use estimation
+    // 2 = 2-level
+    // 3 = 4-level
+    // 4 = 8-level
+    // 5 = full search
+    // 6 = log search
+    int order_method;
+
+    // stereo decorrelation method
+    // set by user prior to calling flake_encode_init
+    // if set to less than 0, it is chosen based on compression.
+    // valid values are 0 to 2
+    // 0 = independent L+R channels
+    // 1 = mid-side encoding
+    int stereo_method;
+
+    // block size in samples
+    // set by the user prior to calling flake_encode_init
+    // if set to 0, a block size is chosen based on block_time_ms
+    // can also be changed by user before encoding a frame
+    int block_size;
+
+    // block time in milliseconds
+    // set by the user prior to calling flake_encode_init
+    // used to calculate block_size based on sample rate
+    // can also be changed by user before encoding a frame
+    int block_time_ms;
+
+    // padding size in bytes
+    // set by the user prior to calling flake_encode_init
+    // if set to less than 0, defaults to 4096
+    int padding_size;
+
+    // maximum encoded frame size
+    // this is set by flake_encode_init based on input audio format
+    // it can be used by the user to allocate an output buffer
+    int max_frame_size;
+
+    // minimum prediction order
+    // set by user prior to calling flake_encode_init
+    // if set to less than 0, it is chosen based on compression.
+    // valid values are 0 to 4 for fixed prediction and 1 to 32 for non-fixed
+    int min_prediction_order;
+
+    // maximum prediction order
+    // set by user prior to calling flake_encode_init
+    // if set to less than 0, it is chosen based on compression.
+    // valid values are 0 to 4 for fixed prediction and 1 to 32 for non-fixed
+    int max_prediction_order;
+
+    // type of linear prediction
+    // set by user prior to calling flake_encode_init
+    // if set to less than 0, it is chosen based on compression.
+    // 0 = fixed prediction
+    // 1 = Levinson-Durbin recursion
+    int prediction_type;
+
+    // minimum partition order
+    // set by user prior to calling flake_encode_init
+    // if set to less than 0, it is chosen based on compression.
+    // valid values are 0 to 8
+    int min_partition_order;
+
+    // maximum partition order
+    // set by user prior to calling flake_encode_init
+    // if set to less than 0, it is chosen based on compression.
+    // valid values are 0 to 8
+    int max_partition_order;
+
+    // whether to use variable block sizes
+    // set by user prior to calling flake_encode_init
+    // 0 = fixed block size
+    // 1 = variable block size
+    int variable_block_size;
+
+}
+
+struct FlakeContext 
+{
+    // number of audio channels
+    // set by user prior to calling flake_encode_init
+    // valid values are 1 to 8
+    int channels;
+
+    // audio sample rate in Hz
+    // set by user prior to calling flake_encode_init
+    int sample_rate;
+
+    // sample size in bits
+    // set by user prior to calling flake_encode_init
+    // only 16-bit is currently supported
+    int bits_per_sample;
+
+    // total stream samples
+    // set by user prior to calling flake_encode_init
+    // if 0, stream length is unknown
+    uint samples;
+
+    FlakeEncodeParams params;
+
+    // maximum frame size in bytes
+    // set by flake_encode_init
+    // this can be used to allocate memory for output
+    int max_frame_size;
+
+    // MD5 digest
+    // set by flake_encode_close;
+    ubyte[16] md5digest;
+
+    // header bytes
+    // allocated by flake_encode_init and freed by flake_encode_close
+    ubyte* header;
+
+    // encoding context, which is hidden from the user
+    // allocated by flake_encode_init and freed by flake_encode_close
+    void* private_ctx;
+}
+
+
+/*
+#define ABS(a) ((a) >= 0 ? (a) : (-(a)))
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#define MIN(a,b) ((a) > (b) ? (b) : (a))
+#define CLIP(x,min,max) MAX(MIN((x), (max)), (min))
+*/
+
+int log2i(uint32_t v)
+{
+    int i;
+    int n = 0;
+    if (v & 0xffff0000) 
+    {
+        v >>= 16;
+        n += 16;
+    }
+    if (v & 0xff00) 
+    {
+        v >>= 8;
+        n += 8;
+    }
+    for (i=2; i<256; i<<=1) 
+    {
+        if (v >= i) {
+            n++;
+        } else 
+        {
+            break;
+        }
+    }
+    return n;
+}
+
+
+uint16_t bswap_16(uint16_t x)
+{
+    return cast(ushort)( (x>>8) | (x<<8) );
+}
+
+uint32_t bswap_32(uint32_t x)
+{
+    x= ((x<<8)&0xFF00FF00) | ((x>>8)&0x00FF00FF);
+    return (x>>16) | (x<<16);
+}
+
+
+// be2me ... BigEndian to MachineEndian
+// le2me ... LittleEndian to MachineEndian
+
+version(BigEndian)
+{
+    uint be2me_32(uint x){ return x; }
+}
+else
+{
+    uint be2me_32(uint x) { return bswap_32(x); }
+}
+
+struct BitWriter 
+{
+    uint32_t bit_buf;
+    int bit_left;
+    uint8_t *buffer, buf_ptr, buf_end;
+    int eof;
+}
+
+
+void bitwriter_init(BitWriter *bw, void *buf, int len)
+{
+    if (len < 0) 
+    {
+        len = 0;
+        buf = null;
+    }
+    bw.buffer = cast(uint8_t*)buf;
+    bw.buf_end = bw.buffer + len;
+    bw.buf_ptr = bw.buffer;
+    bw.bit_left = 32;
+    bw.bit_buf = 0;
+    bw.eof = 0;
+}
+
+uint bitwriter_count(BitWriter *bw)
+{
+    return cast(uint)( ((((bw.buf_ptr - bw.buffer) << 3) + 32 - bw.bit_left) + 7) >> 3 );
+}
+
+void bitwriter_flush(BitWriter *bw)
+{
+    bw.bit_buf <<= bw.bit_left;
+    while (bw.bit_left < 32 && !bw.eof) {
+        if (bw.buf_ptr >= bw.buf_end) {
+            bw.eof = 1;
+            break;
+        }
+        if (bw.buffer != null) {
+            *bw.buf_ptr = bw.bit_buf >> 24;
+        }
+        bw.buf_ptr++;
+        bw.bit_buf <<= 8;
+        bw.bit_left += 8;
+    }
+    bw.bit_left = 32;
+    bw.bit_buf = 0;
+}
+
+void
+bitwriter_writebits(BitWriter *bw, int bits, uint32_t val)
+{
+    uint32_t bb=0;
+    assert(bits == 32 || val < (1U << bits));
+
+    if (bits == 0 || bw.eof) {
+        return;
+    }
+    if ((bw.buf_ptr+3) >= bw.buf_end) {
+        bw.eof = 1;
+        return;
+    }
+    if (bits < bw.bit_left) {
+        bw.bit_buf = (bw.bit_buf << bits) | val;
+        bw.bit_left -= bits;
+    } else {
+        if (bw.bit_left == 32) {
+            assert(bits == 32);
+            bb = val;
+        } else {
+            bb = (bw.bit_buf << bw.bit_left) | (val >> (bits - bw.bit_left));
+            bw.bit_left += (32 - bits);
+        }
+        if (bw.buffer != null) {
+            *cast(uint32_t *)bw.buf_ptr = be2me_32(bb);
+        }
+        bw.buf_ptr += 4;
+        bw.bit_buf = val;
+    }
+}
+
+void
+bitwriter_writebits_signed(BitWriter *bw, int bits, int32_t val)
+{
+    assert(bits >= 0 && bits <= 31);
+    ulong mask = ((1UL << bits)-1);
+    bitwriter_writebits(bw, bits, cast(uint)(val & mask));
+}
+
+void
+bitwriter_write_rice_signed(BitWriter *bw, int k, int32_t val)
+{
+    int v, q;
+
+    if (k < 0) {
+        return;
+    }
+
+    // convert signed to unsigned
+    v = -2*val-1;
+    v ^= (v>>31);
+
+    // write quotient in unary
+    q = (v >> k) + 1;
+    while (q > 31) {
+        bitwriter_writebits(bw, 31, 0);
+        q -= 31;
+    }
+    bitwriter_writebits(bw, q, 1);
+
+    // write write remainder in binary using 'k' bits
+    bitwriter_writebits(bw, k, v&((1<<k)-1));
+}
+
+
+
+
+// lpc.c
+enum MAX_LPC_ORDER = 32;
+
+/**
+ * Apply Welch window function to audio block
+ */
+void
+apply_welch_window(const int32_t *data, int len, double *w_data)
+{
+    int i;
+    double c;
+
+    c = (2.0 / (len - 1.0)) - 1.0;
+    for (i=0; i<(len >> 1); i++) {
+        double w = 1.0 - ((c-i) * (c-i));
+        w_data[i] = data[i] * w;
+        w_data[len-1-i] = data[len-1-i] * w;
+    }
+}
+
+/**
+ * Calculates autocorrelation data from audio samples
+ * A Welch window function is applied before calculation.
+ */
+void compute_autocorr(const int32_t *data, int len, int lag, double *autoc)
+{
+    int i, j;
+    double *data1;
+    double temp, temp2;
+
+    data1 = cast(double*) malloc((len+16) * double.sizeof);
+    apply_welch_window(data, len, data1);
+    data1[len] = 0;
+
+    for (i=0; i<=lag; ++i) {
+        temp = 1.0;
+        temp2 = 1.0;
+        for (j=0; j<=lag-i; ++j) {
+            temp += data1[j+i] * data1[j];
+        }
+
+        for (j=lag+1; j<=len-1; j+=2) {
+            temp += data1[j] * data1[j-i];
+            temp2 += data1[j+1] * data1[j+1-i];
+        }
+        autoc[i] = temp + temp2;
+    }
+
+    free(data1);
+}
+
+/**
+ * Levinson-Durbin recursion.
+ * Produces LPC coefficients from autocorrelation data.
+ */
+void compute_lpc_coefs(const double *autoc, int max_order, double *ref_, double[MAX_LPC_ORDER]* lpc)
+{
+    int i, j, i2;
+    double r, err, tmp;
+    double[MAX_LPC_ORDER] lpc_tmp;
+
+    for (i=0; i<max_order; i++) {
+        lpc_tmp[i] = 0;
+    }
+    err = 1.0;
+    if (autoc) {
+        err = autoc[0];
+    }
+
+    for (i=0; i<max_order; i++) {
+        if (ref_) {
+            r = ref_[i];
+        } else {
+            r = -autoc[i+1];
+            for (j=0; j<i; j++) {
+                r -= lpc_tmp[j] * autoc[i-j];
+            }
+            r /= err;
+            err *= 1.0 - (r * r);
+        }
+
+        i2 = (i >> 1);
+        lpc_tmp[i] = r;
+        for (j=0; j<i2; j++) {
+            tmp = lpc_tmp[j];
+            lpc_tmp[j] += r * lpc_tmp[i-1-j];
+            lpc_tmp[i-1-j] += r * tmp;
+        }
+        if (i & 1) {
+            lpc_tmp[j] += lpc_tmp[j] * r;
+        }
+
+        for (j=0; j<=i; j++) {
+            lpc[i][j] = -lpc_tmp[j];
+        }
+    }
+}
+
+/**
+ * Compute LPC coefs for FLAKE_ORDER_METHOD_EST
+ * Faster LPC coeff computation by first calculating the reflection coefficients
+ * using Schur recursion. That allows for estimating the optimal order before
+ * running Levinson recursion.
+ */
+int
+compute_lpc_coefs_est(const double *autoc, int max_order,
+                      double[MAX_LPC_ORDER]* lpc)
+{
+    int i, j;
+    double error;
+    double[MAX_LPC_ORDER][2] gen;
+    double[MAX_LPC_ORDER] ref_;
+    int order_est;
+
+    // Schur recursion
+    for (i=0; i<max_order; i++) {
+        gen[0][i] = gen[1][i] = autoc[i+1];
+    }
+    error = autoc[0];
+    ref_[0] = -gen[1][0] / error;
+    error += gen[1][0] * ref_[0];
+    for (i=1; i<max_order; i++) {
+        for (j=0; j<max_order-i; j++) {
+            gen[1][j] = gen[1][j+1] + ref_[i-1] * gen[0][j];
+            gen[0][j] = gen[1][j+1] * ref_[i-1] + gen[0][j];
+        }
+        ref_[i] = -gen[1][0] / error;
+        error += gen[1][0] * ref_[i];
+    }
+
+    // Estimate optimal order using reflection coefficients
+    order_est = 1;
+    for (i=max_order-1; i>=0; i--) {
+        if (fabs(ref_[i]) > 0.10) {
+            order_est = i+1;
+            break;
+        }
+    }
+
+    // Levinson recursion
+    compute_lpc_coefs(null, order_est, ref_.ptr, lpc);
+
+    return order_est;
+}
+
+/**
+ * Quantize LPC coefficients
+ */
+void
+quantize_lpc_coefs(double *lpc_in, int order, int precision, int32_t *lpc_out,
+                   int *shift)
+{
+    int i;
+    double d, cmax, error;
+    int32_t qmax;
+    int sh, q;
+
+    // define maximum levels
+    qmax = (1 << (precision - 1)) - 1;
+
+    // find maximum coefficient value
+    cmax = 0.0;
+    for (i=0; i<order; i++) {
+        d = fabs(lpc_in[i]);
+        if (d > cmax) {
+            cmax = d;
+        }
+    }
+    // if maximum value quantizes to zero, return all zeros
+    if (cmax * (1 << 15) < 1.0) {
+        *shift = 0;
+        memset(lpc_out, 0, (int32_t.sizeof) * order);
+        return;
+    }
+
+    // calculate level shift which scales max coeff to available bits
+    sh = 15;
+    while ((cmax * (1 << sh) > qmax) && (sh > 0)) {
+        sh--;
+    }
+
+    // since negative shift values are unsupported in decoder, scale down
+    // coefficients instead
+    if (sh == 0 && cmax > qmax) {
+        double scale = (cast(double)qmax) / cmax;
+        for (i=0; i<order; i++) {
+            lpc_in[i] *= scale;
+        }
+    }
+
+    // output quantized coefficients and level shift
+    error=0;
+    for (i=0; i<order; i++) {
+        error += lpc_in[i] * (1 << sh);
+        q = cast(int)(error + 0.5);
+        if (q <= -qmax) {
+            q = -qmax+1;
+        }
+        if (q > qmax) {
+            q = qmax;
+        }
+        error -= q;
+        lpc_out[i] = q;
+    }
+    *shift = sh;
+}
+
+/**
+ * Calculate LPC coefficients for multiple orders
+ */
+int
+lpc_calc_coefs(const int32_t *samples, int blocksize, int max_order,
+               int precision, int omethod, int32_t[MAX_LPC_ORDER]* coefs,
+               int *shift)
+{
+    double[MAX_LPC_ORDER+1] autoc;
+    double[MAX_LPC_ORDER][MAX_LPC_ORDER] lpc;
+    int i;
+    int opt_order;
+
+    compute_autocorr(samples, blocksize, max_order+1, autoc.ptr);
+
+    opt_order = max_order;
+    if (omethod == FLAKE_ORDER_METHOD_EST) {
+        opt_order = compute_lpc_coefs_est(autoc.ptr, max_order, lpc.ptr);
+    } else {
+        compute_lpc_coefs(autoc.ptr, max_order, null, lpc.ptr);
+    }
+
+    switch (omethod) {
+    case FLAKE_ORDER_METHOD_MAX:
+    case FLAKE_ORDER_METHOD_EST:
+        i = opt_order-1;
+        quantize_lpc_coefs(lpc[i].ptr, i+1, precision, coefs[i].ptr, &shift[i]);
+        break;
+    default:
+        for (i=0; i<max_order; i++) {
+            quantize_lpc_coefs(lpc[i].ptr, i+1, precision, coefs[i].ptr, &shift[i]);
+        }
+        break;
+    }
+
+    return opt_order;
+}
+
+
+
+// rice.c
+enum MAX_RICE_PARAM = 14;
+enum int MAX_PARTITION_ORDER = 8;
+enum int MAX_PARTITIONS = (1 << MAX_PARTITION_ORDER);
+
+struct RiceContext 
+{
+    int porder;                     /* partition order */
+    int[MAX_PARTITIONS] params;     /* Rice parameters */
+    int[MAX_PARTITIONS] esc_bps;    /* bps if using escape code */
+}
+
+uint rice_encode_count(uint sum, int n, int k)
+{
+    return (n * (k+1)) + ((sum - (n>>1)) >> k);
+}
+
+ulong rice_encode_count64(ulong sum, int n, int k)
+{
+    return (n * (k+1)) + ((sum - (n>>1)) >> k);
+}
+
+int find_optimal_rice_param(uint32_t sum, int n)
+{
+    int k, k_opt;
+    uint32_t[MAX_RICE_PARAM+1] nbits;
+
+    k_opt = 0;
+    nbits[0] = uint.max;
+    for (k=0; k<=MAX_RICE_PARAM; k++) 
+    {
+        nbits[k] = rice_encode_count(sum, n, k);
+        if (nbits[k] < nbits[k_opt]) 
+        {
+            k_opt = k;
+        }
+    }
+    return k_opt;
+}
+
+uint32_t calc_optimal_rice_params(RiceContext *rc, int porder, uint32_t *sums, int n, int pred_order)
+{
+    int i;
+    int k, cnt, part;
+    uint32_t all_bits;
+
+    part = (1 << porder);
+    all_bits = 0;
+
+    cnt = (n >> porder) - pred_order;
+    for (i=0; i<part; i++) {
+        if (i == 1) {
+            cnt = (n >> porder);
+        }
+        k = find_optimal_rice_param(sums[i], cnt);
+        rc.params[i] = k;
+        all_bits += rice_encode_count(sums[i], cnt, k);
+    }
+    all_bits += (4 * part);
+
+    rc.porder = porder;
+
+    return all_bits;
+}
+
+void calc_sums(int pmin, int pmax, uint32_t *data, int n, int pred_order, 
+    uint32_t[MAX_PARTITIONS]* sums)
+{
+    int i, j;
+    int parts, cnt;
+    uint32_t *res;
+
+    // sums for highest level
+    parts = (1 << pmax);
+    res = &data[pred_order];
+    cnt = (n >> pmax) - pred_order;
+    for (i=0; i<parts; i++) {
+        if (i == 1) {
+            cnt = (n >> pmax);
+        }
+        if (i > 0) {
+            res = &data[i*cnt];
+        }
+        sums[pmax][i] = 0;
+        for (j=0; j<cnt; j++) {
+            sums[pmax][i] += res[j];
+        }
+    }
+    // sums for lower levels
+    for (i=pmax-1; i>=pmin; i--) {
+        parts = (1 << i);
+        for (j=0; j<parts; j++) {
+            sums[i][j] = sums[i+1][2*j] + sums[i+1][2*j+1];
+        }
+    }
+}
+
+uint32_t
+calc_rice_params(RiceContext *rc, int pmin, int pmax, int32_t *data, int n,
+                 int pred_order)
+{
+    int i;
+    uint32_t[MAX_PARTITION_ORDER+1] bits;
+    int opt_porder;
+    RiceContext tmp_rc;
+    uint32_t *udata;
+    uint32_t[MAX_PARTITIONS][MAX_PARTITION_ORDER+1] sums;
+
+    assert(pmin >= 0 && pmin <= MAX_PARTITION_ORDER);
+    assert(pmax >= 0 && pmax <= MAX_PARTITION_ORDER);
+    assert(pmin <= pmax);
+
+    udata = cast(uint32_t*) malloc(n * uint32_t.sizeof);
+    for (i=0; i<n; i++) 
+    {
+        udata[i] = (2*data[i]) ^ (data[i]>>31);
+    }
+
+    calc_sums(pmin, pmax, udata, n, pred_order, sums.ptr);
+
+    opt_porder = pmin;
+    bits[pmin] = uint.max;
+    for (i=pmin; i<=pmax; i++) {
+        bits[i] = calc_optimal_rice_params(&tmp_rc, i, sums[i].ptr, n, pred_order);
+        if (bits[i] <= bits[opt_porder]) {
+            opt_porder = i;
+            *rc = tmp_rc;
+        }
+    }
+
+    free(udata);
+    return bits[opt_porder];
+}
+
+int MIN_int(int a, int b)
+{
+    return a < b ? a : b;
+}
+
+int get_max_p_order(int max_porder, int n, int order)
+{
+    int porder = MIN_int(max_porder, log2i(n^(n-1)));
+    if (order > 0) {
+        porder = MIN_int(porder, log2i(n/order));
+    }
+    return porder;
+}
+
+uint32_t calc_rice_params_fixed(RiceContext *rc, int pmin, int pmax, int32_t *data,
+                       int n, int pred_order, int bps)
+{
+    uint32_t bits;
+    pmin = get_max_p_order(pmin, n, pred_order);
+    pmax = get_max_p_order(pmax, n, pred_order);
+    bits = pred_order*bps + 6;
+    bits += calc_rice_params(rc, pmin, pmax, data, n, pred_order);
+    return bits;
+}
+
+uint32_t
+calc_rice_params_lpc(RiceContext *rc, int pmin, int pmax, int32_t *data, int n,
+                     int pred_order, int bps, int precision)
+{
+    uint32_t bits;
+    pmin = get_max_p_order(pmin, n, pred_order);
+    pmax = get_max_p_order(pmax, n, pred_order);
+    bits = pred_order*bps + 4 + 5 + pred_order*precision + 6;
+    bits += calc_rice_params(rc, pmin, pmax, data, n, pred_order);
+    return bits;
+}
+
+enum int FLAC_MAX_CH = 8;
+
+enum int FLAC_MIN_BLOCKSIZE = 16;
+enum int FLAC_MAX_BLOCKSIZE = 65535;
+
+
+enum int FLAC_SUBFRAME_CONSTANT = 0;
+enum int FLAC_SUBFRAME_VERBATIM = 1;
+enum int FLAC_SUBFRAME_FIXED    = 8;
+enum int FLAC_SUBFRAME_LPC      = 32;
+
+enum int FLAC_CHMODE_NOT_STEREO    =  0;
+enum int FLAC_CHMODE_LEFT_RIGHT    =  1;
+enum int FLAC_CHMODE_LEFT_SIDE     =  8;
+enum int FLAC_CHMODE_RIGHT_SIDE    =  9;
+enum int FLAC_CHMODE_MID_SIDE      = 10;
+
+struct FlacSubframe 
+{
+    int type;
+    int type_code;
+    int order;
+    int obits;
+    int[MAX_LPC_ORDER] coefs;
+    int shift;
+    int[FLAC_MAX_BLOCKSIZE] samples;
+    int[FLAC_MAX_BLOCKSIZE] residual;
+    RiceContext rc;
+}
+
+struct FlacFrame 
+{
+    int blocksize;
+    int[2] bs_code;
+    int ch_mode;
+    int[2] ch_order;
+    uint8_t crc8;
+    FlacSubframe[FLAC_MAX_CH] subframes;
+}
+
+struct FlacEncodeContext 
+{
+    int channels;
+    int ch_code;
+    int samplerate;
+    int[2] sr_code;
+    int bps;
+    int bps_code;
+    uint32_t sample_count;
+    FlakeEncodeParams params;
+    int max_frame_size;
+    int lpc_precision;
+    uint32_t frame_count;
+    FlacFrame frame;
+    MD5Context md5ctx;
+    BitWriter* bw;
+}
+
+
+// optimize.c
+void encode_residual_verbatim(int32_t* res, int32_t* smp, int n)
+{
+    memcpy(res, smp, n * 4);
+}
+
+void encode_residual_fixed(int32_t* res, int32_t* smp, int n, int order)
+{
+    int i;
+
+    switch (order) 
+    {
+    case 0:
+        memcpy(res, smp, n * 4);
+        return;
+    case 1:
+        res[0] = smp[0];
+        for (i=1; i<n; i++) {
+            res[i] = smp[i] - (smp[i-1]);
+        }
+        return;
+    case 2:
+        res[0] = smp[0];
+        res[1] = smp[1];
+        for (i=2; i<n; i++) {
+            res[i] = smp[i] - 2*smp[i-1] + smp[i-2];
+        }
+        return;
+    case 3:
+        res[0] = smp[0];
+        res[1] = smp[1];
+        res[2] = smp[2];
+        for (i=3; i<n; i++) {
+            res[i] = smp[i] - 3*smp[i-1] + 3*smp[i-2] - smp[i-3];
+        }
+        return;
+    case 4:
+        res[0] = smp[0];
+        res[1] = smp[1];
+        res[2] = smp[2];
+        res[3] = smp[3];
+        for (i=4; i<n; i++) {
+            res[i] = smp[i] - 4*smp[i-1] + 6*smp[i-2] - 4*smp[i-3] + smp[i-4];
+        }
+        return;
+    default:
+        return;
+    }
+}
+
+void encode_residual_lpc(int32_t* res, int32_t* smp, int n, int order,
+                    int32_t* coefs, int shift)
+{
+    int i;
+    int32_t pred;
+
+    for (i=0; i<order; i++) {
+        res[i] = smp[i];
+    }
+    for (i=order; i<n; i++) {
+        pred = 0;
+        // note that all cases fall through.
+        // the result is in an unrolled loop for each order
+        switch (order) {
+        case 32:
+            pred += coefs[31] * smp[i-32]; goto case;
+        case 31:
+            pred += coefs[30] * smp[i-31]; goto case;
+        case 30:
+            pred += coefs[29] * smp[i-30]; goto case;
+        case 29:
+            pred += coefs[28] * smp[i-29]; goto case;
+        case 28:
+            pred += coefs[27] * smp[i-28]; goto case;
+        case 27:
+            pred += coefs[26] * smp[i-27]; goto case;
+        case 26:
+            pred += coefs[25] * smp[i-26]; goto case;
+        case 25:
+            pred += coefs[24] * smp[i-25]; goto case;
+        case 24:
+            pred += coefs[23] * smp[i-24]; goto case;
+        case 23:
+            pred += coefs[22] * smp[i-23]; goto case;
+        case 22:
+            pred += coefs[21] * smp[i-22]; goto case;
+        case 21:
+            pred += coefs[20] * smp[i-21]; goto case;
+        case 20:
+            pred += coefs[19] * smp[i-20]; goto case;
+        case 19:
+            pred += coefs[18] * smp[i-19]; goto case;
+        case 18:
+            pred += coefs[17] * smp[i-18]; goto case;
+        case 17:
+            pred += coefs[16] * smp[i-17]; goto case;
+        case 16:
+            pred += coefs[15] * smp[i-16]; goto case;
+        case 15:
+            pred += coefs[14] * smp[i-15]; goto case;
+        case 14:
+            pred += coefs[13] * smp[i-14]; goto case;
+        case 13:
+            pred += coefs[12] * smp[i-13]; goto case;
+        case 12:
+            pred += coefs[11] * smp[i-12]; goto case;
+        case 11:
+            pred += coefs[10] * smp[i-11]; goto case;
+        case 10:
+            pred += coefs[ 9] * smp[i-10]; goto case;
+        case  9:
+            pred += coefs[ 8] * smp[i- 9]; goto case;
+        case  8:
+            pred += coefs[ 7] * smp[i- 8]; goto case;
+        case  7:
+            pred += coefs[ 6] * smp[i- 7]; goto case;
+        case  6:
+            pred += coefs[ 5] * smp[i- 6]; goto case;
+        case  5:
+            pred += coefs[ 4] * smp[i- 5]; goto case;
+        case  4:
+            pred += coefs[ 3] * smp[i- 4]; goto case;
+        case  3:
+            pred += coefs[ 2] * smp[i- 3]; goto case;
+        case  2:
+            pred += coefs[ 1] * smp[i- 2]; goto case;
+        case  1:
+            pred += coefs[ 0] * smp[i- 1]; goto case;
+        case  0:
+        default:
+            break;
+        }
+        res[i] = smp[i] - (pred >> shift);
+    }
+}
+
+int
+encode_residual(FlacEncodeContext *ctx, int ch)
+{
+    int i;
+    FlacFrame *frame;
+    FlacSubframe *sub;
+    int32_t[MAX_LPC_ORDER][MAX_LPC_ORDER] coefs;
+    int[MAX_LPC_ORDER] shift;
+    int n, max_order, opt_order, min_porder, max_porder;
+    int min_order;
+    int32_t *res, smp;
+    int est_order, omethod;
+
+    frame = &ctx.frame;
+    sub = &frame.subframes[ch];
+    res = sub.residual.ptr;
+    smp = sub.samples.ptr;
+    n = frame.blocksize;
+
+    // CONSTANT
+    for (i=1; i<n; i++) {
+        if (smp[i] != smp[0]) {
+            break;
+        }
+    }
+    if (i == n) {
+        sub.type = sub.type_code = FLAC_SUBFRAME_CONSTANT;
+        res[0] = smp[0];
+        return sub.obits;
+    }
+
+    // VERBATIM
+    if (n < 5 || ctx.params.prediction_type == FLAKE_PREDICTION_NONE) {
+        sub.type = sub.type_code = FLAC_SUBFRAME_VERBATIM;
+        encode_residual_verbatim(res, smp, n);
+        return sub.obits * n;
+    }
+
+    omethod = ctx.params.order_method;
+    min_order = ctx.params.min_prediction_order;
+    max_order = ctx.params.max_prediction_order;
+    opt_order = max_order;
+    min_porder = ctx.params.min_partition_order;
+    max_porder = ctx.params.max_partition_order;
+
+    // FIXED
+    if (ctx.params.prediction_type == FLAKE_PREDICTION_FIXED || n <= max_order) {
+        uint32_t[5] bits;
+        if (max_order > 4) {
+            max_order = 4;
+        }
+        opt_order = min_order;
+        bits[opt_order] = uint.max;
+        for (i=min_order; i<=max_order; i++) {
+            encode_residual_fixed(res, smp, n, i);
+            bits[i] = calc_rice_params_fixed(&sub.rc, min_porder, max_porder, res,
+                                             n, i, sub.obits);
+            if (bits[i] < bits[opt_order]) {
+                opt_order = i;
+            }
+        }
+        sub.order = opt_order;
+        sub.type = FLAC_SUBFRAME_FIXED;
+        sub.type_code = sub.type | sub.order;
+        if (sub.order != max_order) {
+            encode_residual_fixed(res, smp, n, sub.order);
+            return calc_rice_params_fixed(&sub.rc, min_porder, max_porder, res, n,
+                                          sub.order, sub.obits);
+        }
+        return bits[sub.order];
+    }
+
+    // LPC
+    est_order = lpc_calc_coefs(smp, n, max_order, ctx.lpc_precision,
+                               omethod, coefs.ptr, shift.ptr);
+
+    if (omethod == FLAKE_ORDER_METHOD_MAX) {
+        // always use maximum order
+        opt_order = max_order;
+    } else if (omethod == FLAKE_ORDER_METHOD_EST) {
+        // estimated order
+        opt_order = est_order;
+    } else if (omethod == FLAKE_ORDER_METHOD_2LEVEL ||
+                    omethod == FLAKE_ORDER_METHOD_4LEVEL ||
+                    omethod == FLAKE_ORDER_METHOD_8LEVEL) {
+        int levels = 1 << (omethod-1);
+        uint32_t[8] bits;
+        int order;
+        int opt_index = levels-1;
+        opt_order = max_order-1;
+        bits[opt_index] = uint.max;
+        for (i=opt_index; i>=0; i--) {
+            order = min_order + (((max_order-min_order+1) * (i+1)) / levels)-1;
+            if (order < 0) {
+                order = 0;
+            }
+            encode_residual_lpc(res, smp, n, order+1, coefs[order].ptr, shift[order]);
+            bits[i] = calc_rice_params_lpc(&sub.rc, min_porder, max_porder,
+                                           res, n, order+1, sub.obits,
+                                           ctx.lpc_precision);
+            if (bits[i] < bits[opt_index]) {
+                opt_index = i;
+                opt_order = order;
+            }
+        }
+        opt_order++;
+    } else if (omethod == FLAKE_ORDER_METHOD_SEARCH) {
+        // brute-force optimal order search
+        uint32_t[MAX_LPC_ORDER] bits;
+        opt_order = 0;
+        bits[0] = uint.max;
+        for (i=0; i<max_order; i++) {
+            encode_residual_lpc(res, smp, n, i+1, coefs[i].ptr, shift[i]);
+            bits[i] = calc_rice_params_lpc(&sub.rc, min_porder, max_porder,
+                                           res, n, i+1, sub.obits,
+                                           ctx.lpc_precision);
+            if (bits[i] < bits[opt_order]) {
+                opt_order = i;
+            }
+        }
+        opt_order++;
+    } else if (omethod == FLAKE_ORDER_METHOD_LOG) {
+        // log search (written by Michael Niedermayer for FFmpeg)
+        uint32_t[MAX_LPC_ORDER] bits;
+        int step;
+
+        opt_order = min_order - 1 + (max_order-min_order)/3;
+        memset(bits.ptr, -1, bits.sizeof);
+
+        for (step=16; step>0; step>>=1) {
+            int last = opt_order;
+            for (i=last-step; i<=last+step; i+= step) {
+                if (i<min_order-1 || i>=max_order || bits[i] < uint.max) {
+                    continue;
+                }
+                encode_residual_lpc(res, smp, n, i+1, coefs[i].ptr, shift[i]);
+                bits[i] = calc_rice_params_lpc(&sub.rc, min_porder, max_porder,
+                                               res, n, i+1, sub.obits,
+                                               ctx.lpc_precision);
+                if (bits[i] < bits[opt_order]) {
+                    opt_order = i;
+                }
+            }
+        }
+        opt_order++;
+    } else {
+        return -1;
+    }
+
+    sub.order = opt_order;
+    sub.type = FLAC_SUBFRAME_LPC;
+    sub.type_code = sub.type | (sub.order-1);
+    sub.shift = shift[sub.order-1];
+    for (i=0; i<sub.order; i++) {
+        sub.coefs[i] = coefs[sub.order-1][i];
+    }
+    encode_residual_lpc(res, smp, n, sub.order, sub.coefs.ptr, sub.shift);
+    return calc_rice_params_lpc(&sub.rc, min_porder, max_porder, res, n,
+                                sub.order, sub.obits, ctx.lpc_precision);
+}
+
+void
+reencode_residual_verbatim(FlacEncodeContext *ctx, int ch)
+{
+    FlacFrame *frame;
+    FlacSubframe *sub;
+
+    frame = &ctx.frame;
+    sub = &frame.subframes[ch];
+
+    sub.type = sub.type_code = FLAC_SUBFRAME_VERBATIM;
+    encode_residual_verbatim(sub.residual.ptr, sub.samples.ptr, frame.blocksize);
+}
+
+
+
+// encode.c
+static immutable int[16] flac_samplerates = [
+    0, 0, 0, 0,
+    8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000,
+    0, 0, 0, 0
+];
+
+static immutable int[8] flac_bitdepths = [
+    0, 8, 12, 0, 16, 20, 24, 0
+];
+
+static immutable int[15] flac_blocksizes = [
+    0,
+    192,
+    576, 1152, 2304, 4608,
+    0, 0,
+    256, 512, 1024, 2048, 4096, 8192, 16384
+];
+
+
+/**
+ * Write streaminfo metadata block to byte array
+ */
+void write_streaminfo(FlacEncodeContext *ctx, uint8_t *streaminfo, int last)
+{
+    memset(streaminfo, 0, 38);
+    bitwriter_init(ctx.bw, streaminfo, 38);
+
+    // metadata header
+    bitwriter_writebits(ctx.bw, 1, last);
+    bitwriter_writebits(ctx.bw, 7, 0);
+    bitwriter_writebits(ctx.bw, 24, 34);
+
+    if (ctx.params.variable_block_size) {
+        bitwriter_writebits(ctx.bw, 16, 0);
+    } else {
+        bitwriter_writebits(ctx.bw, 16, ctx.params.block_size);
+    }
+    bitwriter_writebits(ctx.bw, 16, ctx.params.block_size);
+    bitwriter_writebits(ctx.bw, 24, 0);
+    bitwriter_writebits(ctx.bw, 24, ctx.max_frame_size);
+    bitwriter_writebits(ctx.bw, 20, ctx.samplerate);
+    bitwriter_writebits(ctx.bw, 3, ctx.channels-1);
+    bitwriter_writebits(ctx.bw, 5, ctx.bps-1);
+
+    // total samples
+    if (ctx.sample_count > 0) {
+        bitwriter_writebits(ctx.bw, 4, 0);
+        bitwriter_writebits(ctx.bw, 32, ctx.sample_count);
+    } else {
+        bitwriter_writebits(ctx.bw, 4, 0);
+        bitwriter_writebits(ctx.bw, 32, 0);
+    }
+}
+
+/**
+ * Write padding metadata block to byte array.
+ */
+static int
+write_padding(FlacEncodeContext *ctx, uint8_t *padding, int last, int padlen)
+{
+    bitwriter_init(ctx.bw, padding, 4);
+
+    // metadata header
+    bitwriter_writebits(ctx.bw, 1, last);
+    bitwriter_writebits(ctx.bw, 7, 1);
+    bitwriter_writebits(ctx.bw, 24, padlen);
+
+    return padlen + 4;
+}
+
+static immutable string vendor_string = "Flake0.11+";
+
+/**
+ * Write vorbis comment metadata block to byte array.
+ * Just writes the vendor string for now.
+ */
+static int
+write_vorbis_comment(FlacEncodeContext *ctx, uint8_t *comment, int last)
+{
+    
+    uint8_t[4] vlen_le;
+
+    enum int vendor_len = cast(int) vendor_string.length;
+    bitwriter_init(ctx.bw, comment, 4);
+
+    // metadata header
+    bitwriter_writebits(ctx.bw, 1, last);
+    bitwriter_writebits(ctx.bw, 7, 4);
+    bitwriter_writebits(ctx.bw, 24, vendor_len+8);
+
+    // vendor string length
+    // note: use me2le_32()
+    vlen_le[0] =  vendor_len        & 0xFF;
+    vlen_le[1] = (vendor_len >>  8) & 0xFF;
+    vlen_le[2] = (vendor_len >> 16) & 0xFF;
+    vlen_le[3] = (vendor_len >> 24) & 0xFF;
+    memcpy(&comment[4], vlen_le.ptr, 4);
+
+    memcpy(&comment[8], vendor_string.ptr, vendor_len);
+
+    memset(&comment[vendor_len+8], 0, 4);
+
+    return vendor_len + 12;
+}
+
+/**
+ * Write fLaC stream marker & metadata headers
+ */
+static int
+write_headers(FlacEncodeContext *ctx, uint8_t *header)
+{
+    int header_size, last;
+
+    header_size = 0;
+    last = 0;
+
+    // stream marker
+    header[0] = 0x66;
+    header[1] = 0x4C;
+    header[2] = 0x61;
+    header[3] = 0x43;
+    header_size += 4;
+
+    // streaminfo
+    write_streaminfo(ctx, &header[header_size], last);
+    header_size += 38;
+
+    // vorbis comment
+    if (ctx.params.padding_size == 0) {
+        last = 1;
+    }
+    header_size += write_vorbis_comment(ctx, &header[header_size], last);
+
+    // padding
+    if (ctx.params.padding_size > 0) {
+        last = 1;
+        header_size += write_padding(ctx, &header[header_size], last,
+                                     ctx.params.padding_size);
+    }
+
+    return header_size;
+}
+
+/**
+ * Set blocksize based on samplerate
+ * Chooses the closest predefined blocksize >= time_ms milliseconds
+ */
+static int
+select_blocksize(int samplerate, int time_ms)
+{
+    int i, target, blocksize;
+
+    blocksize = flac_blocksizes[1];
+    target = (samplerate * time_ms) / 1000;
+    for (i=0; i<15/*FIXME:16*/; i++) {
+        if (target >= flac_blocksizes[i] && flac_blocksizes[i] > blocksize) {
+            blocksize = flac_blocksizes[i];
+        }
+    }
+    return blocksize;
+}
+
+
+/**
+ * Sets encoding defaults based on compression level
+ * params.compression must be set prior to calling
+ */
+int flake_set_defaults(FlakeEncodeParams *params)
+{
+    int lvl;
+
+    if (!params) {
+        return -1;
+    }
+    lvl = params.compression;
+    if ((lvl < 0 || lvl > 12) && (lvl != 99)) {
+        return -1;
+    }
+
+    // default to level 5 params
+    params.order_method = FLAKE_ORDER_METHOD_EST;
+    params.stereo_method = FLAKE_STEREO_METHOD_ESTIMATE;
+    params.block_size = 0;
+    params.block_time_ms = 105;
+    params.prediction_type = FLAKE_PREDICTION_LEVINSON;
+    params.min_prediction_order = 1;
+    params.max_prediction_order = 8;
+    params.min_partition_order = 0;
+    params.max_partition_order = 6;
+    params.padding_size = 4096;
+    params.variable_block_size = 0;
+
+    // differences from level 5
+    switch (lvl) {
+    case 0:
+        params.stereo_method = FLAKE_STEREO_METHOD_INDEPENDENT;
+        params.block_time_ms = 27;
+        params.prediction_type = FLAKE_PREDICTION_FIXED;
+        params.min_prediction_order = 2;
+        params.max_prediction_order = 2;
+        params.min_partition_order = 4;
+        params.max_partition_order = 4;
+        break;
+    case 1:
+        params.block_time_ms = 27;
+        params.prediction_type = FLAKE_PREDICTION_FIXED;
+        params.min_prediction_order = 2;
+        params.max_prediction_order = 3;
+        params.min_partition_order = 2;
+        params.max_partition_order = 2;
+        break;
+    case 2:
+        params.block_time_ms = 27;
+        params.prediction_type = FLAKE_PREDICTION_FIXED;
+        params.min_prediction_order = 2;
+        params.max_prediction_order = 4;
+        params.min_partition_order = 0;
+        params.max_partition_order = 3;
+        break;
+    case 3:
+        params.max_prediction_order = 6;
+        params.max_partition_order = 3;
+        break;
+    case 4:
+        params.max_partition_order = 3;
+        break;
+    case 5:
+        break;
+    case 6:
+        params.order_method = FLAKE_ORDER_METHOD_2LEVEL;
+        params.max_partition_order = 8;
+        break;
+    case 7:
+        params.order_method = FLAKE_ORDER_METHOD_4LEVEL;
+        params.max_partition_order = 8;
+        break;
+    case 8:
+        params.order_method = FLAKE_ORDER_METHOD_4LEVEL;
+        params.max_prediction_order = 12;
+        params.max_partition_order = 8;
+        break;
+    case 9:
+        params.order_method = FLAKE_ORDER_METHOD_LOG;
+        params.max_prediction_order = 12;
+        params.max_partition_order = 8;
+        break;
+    case 10:
+        params.order_method = FLAKE_ORDER_METHOD_SEARCH;
+        params.max_prediction_order = 12;
+        params.max_partition_order = 8;
+        break;
+    case 11:
+        params.order_method = FLAKE_ORDER_METHOD_LOG;
+        params.max_prediction_order = 32;
+        params.max_partition_order = 8;
+        break;
+    case 12:
+        params.order_method = FLAKE_ORDER_METHOD_SEARCH;
+        params.max_prediction_order = 32;
+        params.max_partition_order = 8;
+        break;
+    case 99:
+        params.order_method = FLAKE_ORDER_METHOD_SEARCH;
+        params.block_time_ms = 186;
+        params.max_prediction_order = 32;
+        params.max_partition_order = 8;
+        params.variable_block_size = 2;
+        break;
+
+    default:
+        break;
+    }
+
+    return 0;
+}
+
+
+
+/**
+ * Validates encoding parameters
+ * @return -1 if error. 0 if ok. 1 if ok but non-Subset.
+ */
+int flake_validate_params(FlakeContext *s)
+{
+    int i;
+    int subset = 0;
+    int bs;
+    FlakeEncodeParams *params;
+
+    if (s == null) {
+        return -1;
+    }
+    params = &s.params;
+
+    if (s.channels < 1 || s.channels > FLAC_MAX_CH) {
+        return -1;
+    }
+
+    if (s.sample_rate < 1 || s.sample_rate > 655350) {
+        return -1;
+    }
+    for (i=4; i<12; i++) {
+        if (s.sample_rate == flac_samplerates[i]) {
+            break;
+        }
+    }
+    if (i == 12) {
+        subset = 1;
+    }
+
+    if (s.bits_per_sample < 4 || s.bits_per_sample > 32) {
+        return -1;
+    }
+    for (i=1; i<8; i++) {
+        if (s.bits_per_sample == flac_bitdepths[i]) {
+            break;
+        }
+    }
+    if (i == 8) {
+        subset = 1;
+    }
+
+    if ((params.compression < 0 || params.compression > 12) &&
+                    (params.compression != 99)) {
+        return -1;
+    }
+
+    if (params.order_method < 0 || params.order_method > 6) {
+        return -1;
+    }
+
+    if (params.stereo_method < 0 || params.stereo_method > 1) {
+        return -1;
+    }
+
+    if (params.block_time_ms < 0) {
+        return -1;
+    }
+
+    bs = params.block_size;
+    if (bs == 0) {
+        bs = select_blocksize(s.sample_rate, params.block_time_ms);
+    }
+    if (bs < FLAC_MIN_BLOCKSIZE || bs > FLAC_MAX_BLOCKSIZE) {
+        return -1;
+    }
+    for (i=0; i<15; i++) {
+        if (bs == flac_blocksizes[i]) {
+            break;
+        }
+    }
+    if (i == 15 || (s.sample_rate <= 48000 && bs > 4608)) {
+        subset = 1;
+    }
+
+    if (params.prediction_type < 0 || params.prediction_type > 2) {
+        return -1;
+    }
+
+    if (params.min_prediction_order > params.max_prediction_order) {
+        return -1;
+    }
+    if (params.prediction_type == FLAKE_PREDICTION_FIXED) {
+        if (params.min_prediction_order < 0 ||
+                        params.min_prediction_order > 4) {
+            return -1;
+        }
+        if (params.max_prediction_order < 0 ||
+                        params.max_prediction_order > 4) {
+            return -1;
+        }
+    } else {
+        if (params.min_prediction_order < 1 ||
+                        params.min_prediction_order > 32) {
+            return -1;
+        }
+        if (params.max_prediction_order < 1 ||
+                        params.max_prediction_order > 32) {
+            return -1;
+        }
+        if (s.sample_rate <= 48000 && params.max_prediction_order > 12) {
+            subset = 1;
+        }
+    }
+
+    if (params.min_partition_order > params.max_partition_order) {
+        return -1;
+    }
+    if (params.min_partition_order < 0 || params.min_partition_order > 8) {
+        return -1;
+    }
+    if (params.max_partition_order < 0 || params.max_partition_order > 8) {
+        return -1;
+    }
+
+    if (params.padding_size < 0 || params.padding_size >= (1<<24)) {
+        return -1;
+    }
+
+    if (params.variable_block_size < 0 || params.variable_block_size > 2) {
+        return -1;
+    }
+    if (params.variable_block_size > 0) {
+        subset = 1;
+    }
+
+    return subset;
+}
+
+/**
+ * Initialize encoder
+ */
+int
+flake_encode_init(FlakeContext *s)
+{
+    FlacEncodeContext *ctx;
+    int i, header_len;
+
+    if (s == null) {
+        return -1;
+    }
+
+    // allocate memory
+    ctx = cast(FlacEncodeContext*) calloc(1, FlacEncodeContext.sizeof);
+    s.private_ctx = ctx;
+
+    if (flake_validate_params(s) < 0) {
+        return -1;
+    }
+
+    ctx.channels = s.channels;
+    ctx.ch_code = s.channels-1;
+
+    // find samplerate in table
+    for (i=4; i<12; i++) {
+        if (s.sample_rate == flac_samplerates[i]) {
+            ctx.samplerate = flac_samplerates[i];
+            ctx.sr_code[0] = i;
+            ctx.sr_code[1] = 0;
+            break;
+        }
+    }
+    // if not in table, samplerate is non-standard
+    if (i == 12) {
+        ctx.samplerate = s.sample_rate;
+        if (ctx.samplerate % 1000 == 0 && ctx.samplerate <= 255000) {
+            ctx.sr_code[0] = 12;
+            ctx.sr_code[1] = ctx.samplerate / 1000;
+        } else if (ctx.samplerate % 10 == 0 && ctx.samplerate <= 655350) {
+            ctx.sr_code[0] = 14;
+            ctx.sr_code[1] = s.sample_rate / 10;
+        } else if (ctx.samplerate < 65535) {
+            ctx.sr_code[0] = 13;
+            ctx.sr_code[1] = ctx.samplerate;
+        }
+    }
+
+    for (i=1; i<8; i++) {
+        if (s.bits_per_sample == flac_bitdepths[i]) {
+            ctx.bps = flac_bitdepths[i];
+            ctx.bps_code = i;
+            break;
+        }
+    }
+    if (i == 8) {
+        return -1;
+    }
+    // FIXME: For now, only 16-bit encoding is supported
+    if (ctx.bps != 16) {
+        return -1;
+    }
+
+    ctx.sample_count = s.samples;
+
+    if (s.params.block_size == 0) {
+        s.params.block_size = select_blocksize(ctx.samplerate, s.params.block_time_ms);
+    }
+
+    ctx.params = s.params;
+
+    // select LPC precision based on block size
+    if (     ctx.params.block_size <=   192) {
+        ctx.lpc_precision =  7;
+    } else if (ctx.params.block_size <=   384) {
+        ctx.lpc_precision =  8;
+    } else if (ctx.params.block_size <=   576) {
+        ctx.lpc_precision =  9;
+    } else if (ctx.params.block_size <=  1152) {
+        ctx.lpc_precision = 10;
+    } else if (ctx.params.block_size <=  2304) {
+        ctx.lpc_precision = 11;
+    } else if (ctx.params.block_size <=  4608) {
+        ctx.lpc_precision = 12;
+    } else if (ctx.params.block_size <=  8192) {
+        ctx.lpc_precision = 13;
+    } else if (ctx.params.block_size <= 16384) {
+        ctx.lpc_precision = 14;
+    } else {
+        ctx.lpc_precision = 15;
+    }
+
+    // set maximum encoded frame size (if larger, re-encodes in verbatim mode)
+    if (ctx.channels == 2) {
+        ctx.max_frame_size = 16 + ((ctx.params.block_size * (ctx.bps+ctx.bps+1) + 7) >> 3);
+    } else {
+        ctx.max_frame_size = 16 + ((ctx.params.block_size * ctx.channels * ctx.bps + 7) >> 3);
+    }
+    s.max_frame_size = ctx.max_frame_size;
+
+    // output header bytes
+    ctx.bw = cast(BitWriter*) calloc(BitWriter.sizeof, 1);
+    s.header = cast(ubyte*) calloc(ctx.params.padding_size + 1024, 1);
+    header_len = -1;
+    if (s.header != null) {
+        header_len = write_headers(ctx, s.header);
+    }
+
+    ctx.frame_count = 0;
+
+    // initialize CRC & MD5
+    crc_init();
+    md5_init(&ctx.md5ctx);
+
+    return header_len;
+}
+
+/**
+ * Initialize the current frame before encoding
+ */
+static int
+init_frame(FlacEncodeContext *ctx)
+{
+    int i, ch;
+    FlacFrame *frame;
+
+    frame = &ctx.frame;
+
+    if (ctx.params.block_time_ms < 0) {
+        return -1;
+    }
+    if (ctx.params.block_size == 0) {
+        ctx.params.block_size = select_blocksize(ctx.samplerate, ctx.params.block_time_ms);
+    }
+    if (ctx.params.block_size < 1 ||
+                    ctx.params.block_size > FLAC_MAX_BLOCKSIZE) {
+        return -1;
+    }
+
+    // set maximum encoded frame size (if larger, re-encodes in verbatim mode)
+    if (ctx.channels == 2) {
+        ctx.max_frame_size = 16 + ((ctx.params.block_size * (ctx.bps+ctx.bps+1) + 7) >> 3);
+    } else {
+        ctx.max_frame_size = 16 + ((ctx.params.block_size * ctx.channels * ctx.bps + 7) >> 3);
+    }
+
+    // get block size codes
+    i = 15;
+    if (!ctx.params.variable_block_size) {
+        for (i=0; i<15; i++) {
+            if (ctx.params.block_size == flac_blocksizes[i]) {
+                frame.blocksize = flac_blocksizes[i];
+                frame.bs_code[0] = i;
+                frame.bs_code[1] = -1;
+                break;
+            }
+        }
+    }
+    if (i == 15) {
+        frame.blocksize = ctx.params.block_size;
+        if (frame.blocksize <= 256) {
+            frame.bs_code[0] = 6;
+            frame.bs_code[1] = frame.blocksize-1;
+        } else {
+            frame.bs_code[0] = 7;
+            frame.bs_code[1] = frame.blocksize-1;
+        }
+    }
+
+    // initialize output bps for each channel
+    for (ch=0; ch<ctx.channels; ch++) {
+        frame.subframes[ch].obits = ctx.bps;
+    }
+
+    return 0;
+}
+
+
+static void
+update_md5_checksum(FlacEncodeContext *ctx, int16_t *samples)
+{
+    md5_accumulate(&ctx.md5ctx, samples, ctx.channels, ctx.params.block_size);
+}
+
+/**
+ * Copy channel-interleaved input samples into separate subframes
+ */
+static void
+copy_samples(FlacEncodeContext *ctx, int16_t *samples)
+{
+    int i, j, ch;
+    FlacFrame *frame;
+
+    frame = &ctx.frame;
+    for (i=0,j=0; i<frame.blocksize; i++) {
+        for (ch=0; ch<ctx.channels; ch++,j++) {
+            frame.subframes[ch].samples[i] = samples[j];
+        }
+    }
+}
+
+int abs_int(int x)
+{
+    return x < 0 ? -x : x;
+}
+
+/**
+ * Estimate the best stereo decorrelation mode
+ */
+int calc_decorr_scores(int32_t *left_ch, int32_t *right_ch, int n)
+{
+    int i, best;
+    int32_t lt, rt;
+    uint64_t[4] sum;
+    uint64_t[4] score;
+    int k;
+
+    // calculate sum of 2nd order residual for each channel
+    sum[0] = sum[1] = sum[2] = sum[3] = 0;
+    for (i=2; i<n; i++) {
+        lt = left_ch[i] - 2*left_ch[i-1] + left_ch[i-2];
+        rt = right_ch[i] - 2*right_ch[i-1] + right_ch[i-2];
+        sum[2] += abs_int((lt + rt) >> 1);
+        sum[3] += abs_int(lt - rt);
+        sum[0] += abs_int(lt);
+        sum[1] += abs_int(rt);
+    }
+    // estimate bit counts
+    for (i=0; i<4; i++) {
+        // Note: translation revealed a downcast here,
+        // very probably harmless
+        k = find_optimal_rice_param(cast(uint)(2*sum[i]), n);
+        sum[i] = rice_encode_count64(2*sum[i], n, k);
+    }
+
+    // calculate score for each mode
+    score[0] = sum[0] + sum[1];
+    score[1] = sum[0] + sum[3];
+    score[2] = sum[1] + sum[3];
+    score[3] = sum[2] + sum[3];
+
+    // return mode with lowest score
+    best = 0;
+    for (i=1; i<4; i++) {
+        if (score[i] < score[best]) {
+            best = i;
+        }
+    }
+    switch (best) {
+    case 0:
+        return FLAC_CHMODE_LEFT_RIGHT;
+    case 1:
+        return FLAC_CHMODE_LEFT_SIDE;
+    case 2:
+        return FLAC_CHMODE_RIGHT_SIDE;
+    case 3:
+        return FLAC_CHMODE_MID_SIDE;
+
+    default:
+        break;
+    }
+    return FLAC_CHMODE_LEFT_RIGHT;
+}
+
+/**
+ * Perform stereo channel decorrelation
+ */
+static void
+channel_decorrelation(FlacEncodeContext *ctx)
+{
+    int i;
+    FlacFrame *frame;
+    int32_t* left, right;
+    int32_t tmp;
+
+    frame = &ctx.frame;
+    left  = frame.subframes[0].samples.ptr;
+    right = frame.subframes[1].samples.ptr;
+
+    if (ctx.channels != 2) {
+        frame.ch_mode = FLAC_CHMODE_NOT_STEREO;
+        return;
+    }
+    if (frame.blocksize <= 32 || ctx.params.stereo_method == FLAKE_STEREO_METHOD_INDEPENDENT) {
+        frame.ch_mode = FLAC_CHMODE_LEFT_RIGHT;
+        return;
+    }
+
+    // estimate stereo decorrelation type
+    frame.ch_mode = calc_decorr_scores(left, right, frame.blocksize);
+
+    // perform decorrelation and adjust bits-per-sample
+    if (frame.ch_mode == FLAC_CHMODE_LEFT_RIGHT) {
+        return;
+    }
+    if (frame.ch_mode == FLAC_CHMODE_MID_SIDE) {
+        for (i=0; i<frame.blocksize; i++) {
+            tmp = left[i];
+            left[i] = (left[i] + right[i]) >> 1;
+            right[i] = tmp - right[i];
+        }
+        frame.subframes[1].obits++;
+    } else if (frame.ch_mode == FLAC_CHMODE_LEFT_SIDE) {
+        for (i=0; i<frame.blocksize; i++) {
+            right[i] = left[i] - right[i];
+        }
+        frame.subframes[1].obits++;
+    } else if (frame.ch_mode == FLAC_CHMODE_RIGHT_SIDE) {
+        for (i=0; i<frame.blocksize; i++) {
+            left[i] = left[i] - right[i];
+        }
+        frame.subframes[0].obits++;
+    }
+}
+
+/**
+ * Write UTF-8 encoded integer value
+ * Used to encode frame number in frame header
+ */
+static void
+write_utf8(BitWriter *bw, uint32_t val)
+{
+    int bytes, shift;
+
+    if (val < 0x80) {
+        bitwriter_writebits(bw, 8, val);
+        return;
+    }
+    bytes = (log2i(val)+4) / 5;
+    shift = (bytes - 1) * 6;
+    bitwriter_writebits(bw, 8, (256 - (256>>bytes)) | (val >> shift));
+    while (shift >= 6) {
+        shift -= 6;
+        bitwriter_writebits(bw, 8, 0x80 | ((val >> shift) & 0x3F));
+    }
+}
+
+static void
+output_frame_header(FlacEncodeContext *ctx)
+{
+    FlacFrame *frame;
+    uint8_t crc;
+
+    frame = &ctx.frame;
+
+    bitwriter_writebits(ctx.bw, 16, 0xFFF8);
+    bitwriter_writebits(ctx.bw, 4, frame.bs_code[0]);
+    bitwriter_writebits(ctx.bw, 4, ctx.sr_code[0]);
+    if (frame.ch_mode == FLAC_CHMODE_NOT_STEREO) {
+        bitwriter_writebits(ctx.bw, 4, ctx.ch_code);
+    } else {
+        bitwriter_writebits(ctx.bw, 4, frame.ch_mode);
+    }
+    bitwriter_writebits(ctx.bw, 3, ctx.bps_code);
+    bitwriter_writebits(ctx.bw, 1, 0);
+    write_utf8(ctx.bw, ctx.frame_count);
+
+    // custom block size
+    if (frame.bs_code[1] >= 0) {
+        if (frame.bs_code[1] < 256) {
+            bitwriter_writebits(ctx.bw, 8, frame.bs_code[1]);
+        } else {
+            bitwriter_writebits(ctx.bw, 16, frame.bs_code[1]);
+        }
+    }
+
+    // custom sample rate
+    if (ctx.sr_code[1] > 0) {
+        if (ctx.sr_code[1] < 256) {
+            bitwriter_writebits(ctx.bw, 8, ctx.sr_code[1]);
+        } else {
+            bitwriter_writebits(ctx.bw, 16, ctx.sr_code[1]);
+        }
+    }
+
+    // CRC-8 of frame header
+    bitwriter_flush(ctx.bw);
+    crc = calc_crc8(ctx.bw.buffer, bitwriter_count(ctx.bw));
+    bitwriter_writebits(ctx.bw, 8, crc);
+}
+
+static void
+output_residual(FlacEncodeContext *ctx, int ch)
+{
+    int i, j, p;
+    int k, porder, psize, res_cnt;
+    FlacFrame *frame;
+    FlacSubframe *sub;
+
+    frame = &ctx.frame;
+    sub = &frame.subframes[ch];
+
+    // rice-encoded block
+    bitwriter_writebits(ctx.bw, 2, 0);
+
+    // partition order
+    porder = sub.rc.porder;
+    psize = frame.blocksize >> porder;
+    assert(porder >= 0);
+    bitwriter_writebits(ctx.bw, 4, porder);
+    res_cnt = psize - sub.order;
+
+    // residual
+    j = sub.order;
+    for (p=0; p<(1 << porder); p++) {
+        k = sub.rc.params[p];
+        bitwriter_writebits(ctx.bw, 4, k);
+        if (p == 1) {
+            res_cnt = psize;
+        }
+        for (i=0; i<res_cnt && j<frame.blocksize; i++, j++) {
+            bitwriter_write_rice_signed(ctx.bw, k, sub.residual[j]);
+        }
+    }
+}
+
+static void
+output_subframe_constant(FlacEncodeContext *ctx, int ch)
+{
+    FlacSubframe *sub;
+
+    sub = &ctx.frame.subframes[ch];
+    bitwriter_writebits_signed(ctx.bw, sub.obits, sub.residual[0]);
+}
+
+static void
+output_subframe_verbatim(FlacEncodeContext *ctx, int ch)
+{
+    int i, n;
+    FlacFrame *frame;
+    FlacSubframe *sub;
+
+    frame = &ctx.frame;
+    sub = &frame.subframes[ch];
+    n = frame.blocksize;
+
+    for (i=0; i<n; i++) {
+        bitwriter_writebits_signed(ctx.bw, sub.obits, sub.residual[i]);
+    }
+}
+
+static void
+output_subframe_fixed(FlacEncodeContext *ctx, int ch)
+{
+    int i;
+    FlacFrame *frame;
+    FlacSubframe *sub;
+
+    frame = &ctx.frame;
+    sub = &frame.subframes[ch];
+
+    // warm-up samples
+    for (i=0; i<sub.order; i++) {
+        bitwriter_writebits_signed(ctx.bw, sub.obits, sub.residual[i]);
+    }
+
+    // residual
+    output_residual(ctx, ch);
+}
+
+static void
+output_subframe_lpc(FlacEncodeContext *ctx, int ch)
+{
+    int i, cbits;
+    FlacFrame *frame;
+    FlacSubframe *sub;
+
+    frame = &ctx.frame;
+    sub = &frame.subframes[ch];
+
+    // warm-up samples
+    for (i=0; i<sub.order; i++) {
+        bitwriter_writebits_signed(ctx.bw, sub.obits, sub.residual[i]);
+    }
+
+    // LPC coefficients
+    cbits = ctx.lpc_precision;
+    bitwriter_writebits(ctx.bw, 4, cbits-1);
+    bitwriter_writebits_signed(ctx.bw, 5, sub.shift);
+    for (i=0; i<sub.order; i++) {
+        bitwriter_writebits_signed(ctx.bw, cbits, sub.coefs[i]);
+    }
+
+    // residual
+    output_residual(ctx, ch);
+}
+
+static void
+output_subframes(FlacEncodeContext *ctx)
+{
+    FlacFrame *frame;
+    int i, ch;
+
+    frame = &ctx.frame;
+
+    for (i=0; i<ctx.channels; i++) {
+        ch = i;
+
+        // subframe header
+        bitwriter_writebits(ctx.bw, 1, 0);
+        bitwriter_writebits(ctx.bw, 6, frame.subframes[ch].type_code);
+        bitwriter_writebits(ctx.bw, 1, 0);
+
+        // subframe
+        switch (frame.subframes[ch].type) {
+        case FLAC_SUBFRAME_CONSTANT:
+            output_subframe_constant(ctx, ch);
+            break;
+        case FLAC_SUBFRAME_VERBATIM:
+            output_subframe_verbatim(ctx, ch);
+            break;
+        case FLAC_SUBFRAME_FIXED:
+            output_subframe_fixed(ctx, ch);
+            break;
+        case FLAC_SUBFRAME_LPC:
+            output_subframe_lpc(ctx, ch);
+            break;
+        default: break;
+        }
+    }
+}
+
+static void
+output_frame_footer(FlacEncodeContext *ctx)
+{
+    uint16_t crc;
+    bitwriter_flush(ctx.bw);
+    crc = calc_crc16(ctx.bw.buffer, bitwriter_count(ctx.bw));
+    bitwriter_writebits(ctx.bw, 16, crc);
+    bitwriter_flush(ctx.bw);
+}
+
+int
+encode_frame(FlakeContext *s, uint8_t *frame_buffer, int16_t *samples)
+{
+    int i, ch;
+    FlacEncodeContext *ctx;
+
+    ctx = cast(FlacEncodeContext *) s.private_ctx;
+    if (ctx == null) {
+        return -1;
+    }
+
+    ctx.params.block_size = s.params.block_size;
+    if (init_frame(ctx)) {
+        return -1;
+    }
+    s.params.block_size = ctx.params.block_size;
+
+    if (frame_buffer != null) {
+        update_md5_checksum(ctx, samples);
+    }
+
+    copy_samples(ctx, samples);
+
+    channel_decorrelation(ctx);
+
+    for (ch=0; ch<ctx.channels; ch++) {
+        if (encode_residual(ctx, ch) < 0) {
+            return -1;
+        }
+    }
+
+    bitwriter_init(ctx.bw, frame_buffer, ctx.max_frame_size);
+    output_frame_header(ctx);
+    output_subframes(ctx);
+    output_frame_footer(ctx);
+
+    if (ctx.bw.eof) {
+        // frame size too large, reencode in verbatim mode
+        for (i=0; i<ctx.channels; i++) {
+            ch = i;
+            reencode_residual_verbatim(ctx, ch);
+        }
+        bitwriter_init(ctx.bw, frame_buffer, ctx.max_frame_size);
+        output_frame_header(ctx);
+        output_subframes(ctx);
+        output_frame_footer(ctx);
+
+        // if still too large, means my estimate is wrong.
+        assert(!ctx.bw.eof);
+    }
+    if (frame_buffer != null) {
+        if (ctx.params.variable_block_size) {
+            ctx.frame_count += s.params.block_size;
+        } else {
+            ctx.frame_count++;
+        }
+    }
+    return bitwriter_count(ctx.bw);
+}
+
+
+
+// vbs.c
+enum SPLIT_THRESHOLD = 100;
+
+
+long abs_long(long x)
+{
+    return x < 0 ? -x : x;
+}
+
+/**
+ * Split single frame into smaller frames using predictability comparison.
+ * This algorithm computes predictablity estimates for sections of the frame
+ * by first summing the absolute value of fixed 2nd order residual, averaged
+ * across all channels.  The predictability is compared between adjacent
+ * sections to determine if they should be merged based on a fixed comparison
+ * threshold.
+ */
+static void
+split_frame_v1(int16_t *samples, int channels, int block_size,
+               int *frames, int* sizes /* [8] */)
+{
+    int i, ch, j;
+    int n = block_size >> 3;
+    int64_t[8] res;
+    int[8] layout;
+    int16_t* sptr, sptr0, sptr1, sptr2;
+
+    // calculate absolute sum of 2nd order residual
+    for (i=0; i<8; i++) {
+        sptr = &samples[i*n*channels];
+        res[i] = 0;
+        for (ch=0; ch<channels; ch++) {
+            sptr0 = sptr + (2*channels+ch);
+            sptr1 = sptr0 - channels;
+            sptr2 = sptr1 - channels;
+            for (j=2; j<n; j++) {
+                res[i] += abs_int((*sptr0) - 2*(*sptr1) + (*sptr2));
+                sptr0 += channels;
+                sptr1 += channels;
+                sptr2 += channels;
+            }
+        }
+        res[i] /= channels;
+        res[i]++;
+    }
+
+    // determine frame layout
+    memset(layout.ptr, 0, 8 * int.sizeof);
+    layout[0] = 1;
+    for (i=0; i<7; i++) {
+        if (abs_long(res[i]-res[i+1])*200 / res[i] > SPLIT_THRESHOLD) {
+            layout[i+1] = 1;
+        }
+    }
+
+    // generate frame count and frame sizes from layout
+    frames[0] = 0;
+    memset(sizes, 0, 8 * int.sizeof);
+    for (i=0; i<8; i++) {
+        if (layout[i]) {
+            frames[0]++;
+        }
+        sizes[frames[0]-1] += n;
+    }
+}
+
+void split_frame_v2(FlakeContext *s, int16_t *samples, int *frames, int* sizes)
+{
+    int[8][4] fsizes;
+    int[8] layout;
+    int i, j, n, ch;
+    FlacEncodeContext *ctx = cast(FlacEncodeContext *) s.private_ctx;
+    ch = ctx.channels;
+
+    // encode for each level to get sizes
+    for (i=0; i<4; i++) {
+        int levels, bs;
+        levels = (1<<i);
+        s.params.block_size /= levels;
+        bs = s.params.block_size;
+        for (j=0; j<levels; j++) {
+            fsizes[i][j] = encode_frame(s, null, &samples[bs*j*ch]);
+        }
+        s.params.block_size *= levels;
+    }
+
+    // initialize layout
+    for (i=0; i<8; i++) {
+        layout[i] = 1;
+    }
+    // level 3 merge
+    if (fsizes[2][0] < (fsizes[3][0]+fsizes[3][1])) {
+        layout[1] = 0;
+    }
+    if (fsizes[2][1] < (fsizes[3][2]+fsizes[3][3])) {
+        layout[3] = 0;
+    }
+    if (fsizes[2][2] < (fsizes[3][4]+fsizes[3][5])) {
+        layout[5] = 0;
+    }
+    if (fsizes[2][3] < (fsizes[3][6]+fsizes[3][7])) {
+        layout[7] = 0;
+    }
+    // level 2 merge
+    if (layout[1] == 0 && layout[3] == 0) {
+        if (fsizes[1][0] < (fsizes[2][0]+fsizes[2][1])) {
+            layout[2] = 0;
+        }
+    }
+    if (layout[5] == 0 && layout[7] == 0) {
+        if (fsizes[1][1] < (fsizes[2][2]+fsizes[2][3])) {
+            layout[6] = 0;
+        }
+    }
+    // level 1 merge
+    if (layout[2] == 0 && layout[6] == 0) {
+        if (fsizes[0][0] < (fsizes[1][0]+fsizes[1][1])) {
+            layout[4] = 0;
+        }
+    }
+
+    // generate frame count and frame sizes from layout
+    n = s.params.block_size >> 3;
+    frames[0] = 0;
+    memset(sizes, 0, 8 * int.sizeof);
+    for (i=0; i<8; i++) {
+        if (layout[i]) {
+            frames[0]++;
+        }
+        sizes[frames[0]-1] += n;
+    }
+}
+
+int
+encode_frame_vbs(FlakeContext *s, uint8_t *frame_buffer, int16_t *samples)
+{
+    int fs;
+    int frames;
+    int[8] sizes;
+    FlacEncodeContext *ctx;
+
+    ctx = cast(FlacEncodeContext *) s.private_ctx;
+
+    switch (ctx.params.variable_block_size) {
+    case 1:
+        split_frame_v1(samples, s.channels, s.params.block_size, &frames, sizes.ptr);
+        break;
+    case 2:
+        split_frame_v2(s, samples, &frames, sizes.ptr);
+        break;
+    default:
+        frames = 1;
+        break;
+    }
+    if (frames > 1) {
+        int i, fpos, spos, bs;
+        fpos = 0;
+        spos = 0;
+        bs = s.params.block_size;
+        for (i=0; i<frames; i++) {
+            s.params.block_size = sizes[i];
+            fs = encode_frame(s, &frame_buffer[fpos], &samples[spos*ctx.channels]);
+            if (fs < 0) {
+                return -1;
+            }
+            fpos += fs;
+            spos += sizes[i];
+        }
+        s.params.block_size = bs;
+        assert(spos == bs);
+        return fpos;
+    }
+    fs = encode_frame(s, frame_buffer, samples);
+    return fs;
+}
+
+
+
+// encode.c
+int
+flake_encode_frame(FlakeContext *s, uint8_t *frame_buffer, int16_t *samples)
+{
+    int fs;
+    FlacEncodeContext *ctx;
+
+    ctx = cast(FlacEncodeContext *) s.private_ctx;
+    fs = -1;
+    if ((ctx.params.variable_block_size > 0) &&
+                    !(s.params.block_size & 7) && s.params.block_size >= 128) {
+        fs = encode_frame_vbs(s, frame_buffer, samples);
+    } else {
+        fs = encode_frame(s, frame_buffer, samples);
+    }
+    return fs;
+}
+
+void
+flake_encode_close(FlakeContext *s)
+{
+    FlacEncodeContext *ctx;
+
+    if (s == null) {
+        return;
+    }
+    if (s.private_ctx == null) {
+        return;
+    }
+    ctx = cast(FlacEncodeContext *) s.private_ctx;
+    if (ctx) {
+        md5_final(s.md5digest.ptr, &ctx.md5ctx);
+        if (ctx.bw) {
+            free(ctx.bw);
+        }
+        free(ctx);
+    }
+    if (s.header) {
+        free(s.header);
+    }
+    s.private_ctx = null;
+}
+
+final class FLACEncoder
+{
+public:
+@nogc:
+nothrow:
+
+    this(IOCallbacks* io, 
+         void* userData, 
+         int sampleRate, 
+         int numChannels, 
+         int flacQuality,
+         bool* err)
+    {
+        *err = true;
+        _userData = userData;
+        _io = io;
+        _channels = numChannels;
+
+        _flakeCtx.channels = numChannels;
+        _flakeCtx.sample_rate = sampleRate;
+        _flakeCtx.bits_per_sample = 16;
+        _flakeCtx.samples = 0; // unknown yet
+
+        _flakeCtx.params.compression = flacQuality;
+
+        if (flake_set_defaults(&_flakeCtx.params)) return;
+
+        int subset = flake_validate_params(&_flakeCtx);
+        if (subset < 0)
+            return;
+
+        if (subset == 1)
+            // The chosen encoding options are not FLAC Subset compliant.
+            // Some decoders won't decode that.
+            return;
+
+        // initialize encoder
+        int header_size = flake_encode_init(&_flakeCtx);
+        if (header_size < 0) {
+            flake_encode_close(&_flakeCtx);
+            return;
+        }
+
+        // Write header
+        if (header_size != _io.write(_flakeCtx.header, header_size, _userData))
+            return; // exit if header write fail
+
+        // Allocate space for output frames
+        _outBuf.reallocBuffer(_flakeCtx.max_frame_size);
+        _inBuf.reallocBuffer(_flakeCtx.params.block_size * _channels);
+        inBlock = 0;
+        blockSize = _flakeCtx.params.block_size;
+
+        *err = false;
+    }
+
+    int writeSamples(const(float)* inSamples, int frames, bool* err)
+    {
+        int n = 0;
+        *err = true;
+        while (n < frames)
+        {
+            // How many frames can we push into input buffer?
+            int remain = frames - n;
+            int possible = blockSize - inBlock;
+            if (possible > remain)
+                possible = remain;
+
+            for (int k = 0; k < possible; ++k)
+            {
+                for (int ch = 0; ch < _channels; ++ch)
+                {
+                    float sample = inSamples[(n + k) * _channels + ch];
+                    if (sample > 1) sample = 1;
+                    if (sample < -1) sample = -1;
+                    int asInt = cast(int)(32767.0f * sample);
+                    assert(asInt >= -32767 && asInt <= 32767);
+                    _inBuf[(inBlock + k)*_channels + ch] = cast(short) asInt;
+                }
+            }
+            n += possible;
+            inBlock += possible;
+            
+            // Input buffer is either full and ready to go, or still filling up.
+            if (inBlock == blockSize)
+            {
+                if (!encodeFrame())
+                    return 0;
+                inBlock = 0;
+            }
+        }
+        *err = false;
+        return frames;
+    }   
+
+    bool encodeFrame()
+    {
+        int frame_bytes = flake_encode_frame(&_flakeCtx, _outBuf.ptr, _inBuf.ptr);
+        if (frame_bytes < 0)
+            return false; // encoding error
+        if (frame_bytes != _io.write(_outBuf.ptr, frame_bytes, _userData))
+            return false; // exit if frame write fail
+        return true;
+    }
+
+    void finalizeEncoding(bool* err) 
+    {
+        *err = true;
+        // Flush remaining samples?
+        if (inBlock > 0)
+        {
+            _flakeCtx.params.block_size = inBlock;
+            if (!encodeFrame())
+                return;
+        }
+        flake_encode_close(&_flakeCtx);
+        *err = false;
+    }
+
+    ~this()
+    {
+        _outBuf.reallocBuffer(0);
+        _inBuf.reallocBuffer(0);
+    }
+
+private:
+    int _channels;
+    void* _userData;
+    IOCallbacks* _io;
+    FlakeContext _flakeCtx;
+    ubyte[] _outBuf;
+    short[] _inBuf;
+
+    // How many frames are into _inBuf already?
+    int inBlock = 0;
+    int blockSize = 0;
+}

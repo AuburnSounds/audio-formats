@@ -5,13 +5,11 @@
 
     "dependencies": 
     {
-        "audio-formats": { "path": "../.." },
-        "nurt": ">=0.2.1"
+        "audio-formats": { "path": "../.." }
     },
 
     "subConfigurations":
     {
-        "audio-formats": "lgpl",
-        "nurt": "nurt-disabled"
+        "audio-formats": "lgpl"
     }
 }
