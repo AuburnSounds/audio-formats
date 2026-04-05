@@ -82,11 +82,16 @@ int main(string[] args)
         totalFrames += framesRead;
     } while(framesRead > 0);
 
+    // Always call this for output, else the stream might be incomplete or non-working!
     if (!output.finalizeEncoding())
     {
         const(char)[] err = output.errorMessage;
         printf("error while encoding: %.*s\n", cast(int) err.length, err.ptr);
     }
+
+    // Note: if you need bytes on the disk right now, call output.flush()
+    // .finalizeEncoding call all the fwrite needed for footer and complete signal,
+    // while .flush call .fflush
 
     printf("=> %d frames decoded and encoded to %.*s\n", totalFrames, cast(int)outputPath.length, outputPath.ptr);
     return 0;
