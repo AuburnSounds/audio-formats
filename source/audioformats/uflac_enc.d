@@ -36,11 +36,6 @@ import audioformats.io;
 import audioformats.internals;
 import audioformats.uflac_md5;
 
-// PERF: whole MD5 hash business looks unused?
-
-// TODO remove that
-import core.stdc.stdio: stderr, FILE, fprintf, fopen, fclose, fwrite;
-
 nothrow @nogc:
 
 enum int FLAKE_ORDER_METHOD_MAX    = 0;
@@ -178,10 +173,6 @@ struct FlakeContext
     // set by flake_encode_init
     // this can be used to allocate memory for output
     int max_frame_size;
-
-    // MD5 digest
-    // set by flake_encode_close;
-    ubyte[16] md5digest;
 
     // header bytes
     // allocated by flake_encode_init and freed by flake_encode_close
@@ -839,7 +830,6 @@ struct FlacEncodeContext
     int lpc_precision;
     uint32_t frame_count;
     FlacFrame frame;
-    MD5Context md5ctx;
     BitWriter* bw;
 }
 
@@ -1676,9 +1666,8 @@ flake_encode_init(FlakeContext *s)
 
     ctx.frame_count = 0;
 
-    // initialize CRC & MD5
+    // initialize CRC
     crc_init();
-    md5_init(&ctx.md5ctx);
 
     return header_len;
 }
@@ -1741,13 +1730,6 @@ init_frame(FlacEncodeContext *ctx)
     }
 
     return 0;
-}
-
-
-static void
-update_md5_checksum(FlacEncodeContext *ctx, int16_t *samples)
-{
-    md5_accumulate(&ctx.md5ctx, samples, ctx.channels, ctx.params.block_size);
 }
 
 /**
@@ -2115,10 +2097,6 @@ encode_frame(FlakeContext *s, uint8_t *frame_buffer, int16_t *samples)
     }
     s.params.block_size = ctx.params.block_size;
 
-    if (frame_buffer != null) {
-        update_md5_checksum(ctx, samples);
-    }
-
     copy_samples(ctx, samples);
 
     channel_decorrelation(ctx);
@@ -2369,7 +2347,6 @@ flake_encode_close(FlakeContext *s)
     }
     ctx = cast(FlacEncodeContext *) s.private_ctx;
     if (ctx) {
-        md5_final(s.md5digest.ptr, &ctx.md5ctx);
         if (ctx.bw) {
             free(ctx.bw);
         }
